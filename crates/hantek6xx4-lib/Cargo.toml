@@ -1,0 +1,15 @@
+[package]
+name = "hantek6xx4-lib"
+description = "Driver library for Hantek 6xx4-series USB oscilloscopes (first target: 6254BC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["oscilloscope", "hantek", "usb", "driver"]
+categories = ["hardware-support"]
+
+[dependencies]
+rusb = "0.9"
+thiserror = "1"
+log = "0.4"

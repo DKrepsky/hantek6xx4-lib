@@ -1,0 +1,18 @@
+[package]
+name = "hantek6xx4-cli"
+description = "Command line tool to talk to Hantek 6xx4-series USB oscilloscopes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hantek6xx4"
+path = "src/main.rs"
+
+[dependencies]
+hantek6xx4-lib = { path = "../hantek6xx4-lib" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
