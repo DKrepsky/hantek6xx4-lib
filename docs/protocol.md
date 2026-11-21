@@ -597,7 +597,7 @@ Idx 0–3 are dominated by input noise (sd 20 counts at 2 mV).
 **AC coupling:** clearing relay-byte bit 2 (DC → AC) is accepted and the shorted-input result is unchanged (as expected); the DC/AC difference itself needs a signal with
 a DC offset to confirm.
 
-Remaining open: volts-per-count scale (needs a known voltage or `0xA2/0x1B00` decoding), AC coupling with a DC-offset signal, true 1 GS/s rate, pulse/video triggers, scan/roll, AWG, `0xEC/0xED/0xE3/0xF4`.
+Remaining open (updated in 10.7-10.9: volts scale, AC coupling and the sample rate are now verified): pulse/video triggers, scan/roll, AWG, `0xEC/0xED/0xE3/0xF4`.
 
 ### 10.7 Amplitude table (`0xA2/0x1B00`, per-unit gain trim) — VERIFIED
 
@@ -636,3 +636,19 @@ Position 128 is code 128 in every mode, and the zero span is 8 divisions in each
 Zero levels vary by a few counts between ranges; the table gives typical values, so volts can be off by 2-3 counts
 (up to about 5 % of a division-scale reading) at extreme positions in the fast modes. Ranges below 200 mV/div and above
 1 V/div have not been checked against a reference. The scale comes from one unit.
+
+### 10.9 AC coupling and sample clock — VERIFIED (CH2 on a 0.994 V DC source, CH4 on the 1 kHz calibrator)
+
+- **AC coupling** (relay byte with the DC bit cleared, set by `Coupling::Ac`): CH2 reads 1.000 V in DC and about
+  -0.005 V in AC (the DC level is blocked). CH4's calibrator square wave reads 0..1.9 V in DC and -0.95..+0.95 V in AC
+  (mean 0.009 V). Plateau separation on CH4 is 1.908 V and matches CH2's 1.907 V, so the channels agree to 0.1 %;
+  the calibrator's real output is about 1.91 V, not the nominal 2 V.
+- **Sample clock**: the mean calibrator period measured on the time axis is 1000.000 us (+-0.001 %) at 200 us to 50 ms per
+  division (up to 818 periods averaged), and the 500 us half period holds at 50 us per division (idx 13). So
+  `sample_interval_ns` (= ns per division / 250 for idx >= 8) is exact from idx 13 to 22.
+- **Fast timebases (idx 0..12)**: the calibrator is too slow for a period measurement, but its edge has a finite
+  rise time. The 10-90 % rise measured about 240-256 ns at every timebase from 20 us/div (80 ns interval) to 2 ns/div
+  (1 ns interval), e.g. 4 samples at 80 ns, 31 at 8 ns, 63 at 4 ns and about 250 at 1 ns. The intervals are therefore
+  consistent with the verified clock, including the 1 GS/s one channel mode and the 500 MS/s two channel mode at
+  500 ns/div. Sample amplitudes in modes 1 and 2 are lower than in mode 4 (see 10.8).
+
