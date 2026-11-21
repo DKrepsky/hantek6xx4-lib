@@ -124,8 +124,8 @@ Releases are automated with [release-plz](https://release-plz.dev); do not bump 
 by hand. Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
 `fix:` and breaking changes (`feat!:` or a `BREAKING CHANGE:` footer) trigger a release, while `docs:`, `ci:`, `chore:`
 and `test:` do not. On every push to `main` the workflow opens or updates a release pull request with the version bump
-and changelog; merging it publishes both crates to crates.io (token: the `CARGO_REGISTRY_TOKEN` secret of the `release`
-environment), tags `vX.Y.Z` and creates the GitHub release. All GitHub Actions are pinned to full commit SHAs.
+and changelog; merging it publishes both crates to crates.io, tags `vX.Y.Z` and creates the GitHub release. The tokens
+(`CARGO_REGISTRY_TOKEN`, `RELEASE_PLZ_TOKEN`) are secrets of the `release` environment. All GitHub Actions are pinned to full commit SHAs.
 
 ## Acknowledgements
 
