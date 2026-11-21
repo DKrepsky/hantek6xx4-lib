@@ -20,6 +20,9 @@ pub enum Error {
     /// The device did not become ready in time.
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    /// Scan/roll data was probably lost because the capture RAM wrapped before it was read.
+    #[error("roll buffer overrun: the scope was polled too slowly, samples were lost")]
+    Overrun,
     /// The calibration table stored in the device failed its validity check.
     #[error("calibration table in the device is invalid")]
     BadCalibration,

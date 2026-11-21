@@ -39,6 +39,17 @@ enum Cmd {
     },
     /// Configure the scope and capture one frame
     Capture(CaptureArgs),
+    /// Stream samples continuously (scan/roll style) and print them as they arrive
+    Roll {
+        #[command(flatten)]
+        capture: CaptureArgs,
+        /// How long to run, in seconds
+        #[arg(long, default_value_t = 10.0)]
+        duration: f64,
+        /// Delay between polls of the scope, in milliseconds
+        #[arg(long, default_value_t = 200)]
+        poll_ms: u64,
+    },
     /// Send raw commands (low level, for protocol exploration)
     Raw {
         #[command(subcommand)]
@@ -336,11 +347,16 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Capture(a) => capture(cli.device, a)?,
+        Cmd::Roll {
+            capture,
+            duration,
+            poll_ms,
+        } => roll(cli.device, capture, duration, poll_ms)?,
     }
     Ok(())
 }
 
-fn capture(device: usize, a: CaptureArgs) -> Result<()> {
+fn build_config(a: &CaptureArgs) -> Result<Config> {
     let mut cfg = Config::default();
     let vdiv: VoltsPerDiv = a.vdiv.parse()?;
     let enabled: Vec<usize> = a
@@ -398,6 +414,99 @@ fn capture(device: usize, a: CaptureArgs) -> Result<()> {
         },
     };
 
+    Ok(cfg)
+}
+
+/// Stream samples: CSV rows (`time_ns` then one column per enabled channel) or one summary line per poll.
+/// The trigger options of the capture command are ignored.
+fn roll(device: usize, a: CaptureArgs, duration: f64, poll_ms: u64) -> Result<()> {
+    let cfg = build_config(&a)?;
+    let mut scope = open(device)?;
+    scope.configure(&cfg)?;
+    let mut out: Box<dyn Write> = match &a.output {
+        Some(f) => Box::new(std::fs::File::create(f)?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let chans: Vec<Channel> = Channel::ALL
+        .into_iter()
+        .filter(|c| cfg.channels[c.index()].enabled)
+        .collect();
+    if matches!(a.format, Format::Csv) {
+        let header: Vec<String> = std::iter::once("time_ns".to_string())
+            .chain(
+                chans
+                    .iter()
+                    .map(|c| format!("ch{}{}", c.index() + 1, if a.volts { "_v" } else { "" })),
+            )
+            .collect();
+        writeln!(out, "{}", header.join(","))?;
+    }
+    scope.start_roll()?;
+    let start = std::time::Instant::now();
+    let mut total: u64 = 0;
+    while start.elapsed().as_secs_f64() < duration {
+        std::thread::sleep(Duration::from_millis(poll_ms));
+        let frame = match scope.poll_roll() {
+            Ok(f) => f,
+            Err(hantek6xx4_lib::Error::Overrun) => {
+                eprintln!("warning: polled too slowly, samples were lost");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let n = frame.channel(chans[0]).map(|s| s.len()).unwrap_or(0);
+        match a.format {
+            Format::Csv => {
+                for i in 0..n {
+                    let t = (total + i as u64) as f64 * frame.sample_interval_ns;
+                    let row: Vec<String> = std::iter::once(format!("{t}"))
+                        .chain(chans.iter().map(|&c| {
+                            let code = frame.channel(c).unwrap()[i];
+                            if a.volts {
+                                format!("{:.4}", frame.code_to_volts(c, code))
+                            } else {
+                                code.to_string()
+                            }
+                        }))
+                        .collect();
+                    writeln!(out, "{}", row.join(","))?;
+                }
+            }
+            Format::Summary => {
+                let parts: Vec<String> = chans
+                    .iter()
+                    .filter_map(|&c| {
+                        let s = frame.channel(c)?;
+                        let mean = s.iter().map(|&x| x as f64).sum::<f64>() / s.len().max(1) as f64;
+                        Some(format!("CH{} mean {:.1}", c.index() + 1, mean))
+                    })
+                    .collect();
+                writeln!(
+                    out,
+                    "{:6.2}s +{} samples  {}",
+                    start.elapsed().as_secs_f64(),
+                    n,
+                    parts.join("  ")
+                )?;
+            }
+            Format::Raw => {
+                for i in 0..n {
+                    for &c in &chans {
+                        out.write_all(&[frame.channel(c).unwrap()[i]])?;
+                    }
+                }
+            }
+        }
+        out.flush()?;
+        total += n as u64;
+    }
+    scope.stop()?;
+    eprintln!("{total} samples per channel in {:.1} s", start.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn capture(device: usize, a: CaptureArgs) -> Result<()> {
+    let cfg = build_config(&a)?;
     let mut scope = open(device)?;
     scope.configure(&cfg)?;
     let frame = scope.capture(CaptureOptions {

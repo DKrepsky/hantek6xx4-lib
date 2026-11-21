@@ -684,3 +684,27 @@ logic source (0) | 32`. The 1-based line number is remapped to the hardware coun
 3 even field, 4 all fields (the line number is 1 for the modes that do not use one). On the calibrator the device accepts
 the command, never triggers (it is not a video signal) and an edge capture works normally afterwards.
 
+### 10.11 Scan and roll modes — VERIFIED (CH4 on the 1 kHz calibrator, CH2 on DC)
+
+In the vendor software scan (time base idx >= 25, 500 ms/div) and roll (idx >= 27, 2 s/div) are display modes on top of
+one hardware behaviour: after `03 00 flags 00` the FPGA keeps writing samples into the 64 KiB circular capture RAM and the
+host reads what is new (`dsoHTGetScanData` / `dsoHTGetRollData` -> `FUN_10005b60` / `FUN_10005d60`):
+1. send `0D 00`, read the status; `u16 @ 2` is the write pointer (end address), `u16 @ 0` the stale trigger address;
+2. new bytes = `(end - last) mod 0x10000`, rounded down to whole frames (`frame_stride` bytes per frame, even);
+3. `0E 00 last_lo last_hi` (read address), `05 00 words_lo words_hi` (read back `bytes / 2` words), read the bytes;
+4. remember `end` as the new `last`. (The vendor roll path adds 8 to the read address on its very first read; not needed.)
+`dsoHTSetSampleRate`'s `nYTFormat` argument is ignored by the DLL, `dsoHTOpenRollMode`/`dsoHTCloseRollMode`/
+`dsoHTStartRoll` do nothing, and the start flags (bit 0 auto, bit 1 roll) made no difference to the pointer on a 6254BC
+(the state word stays `0xc100`, never "ready"). The RAM size is 0x10000 bytes (0x8000 for the CAN/LIN/UART/SPI/I2C trigger
+modes, not implemented here).
+
+Measured: the pointer advances in steps of 8 bytes at `frame_stride / sample_interval` bytes per second (500 B/s for one
+channel at 500 ms/div; 5000 B/s for four channels at 200 ms/div), so at slow time bases data arrives in bursts of 8 bytes
+(one burst every 0.64 s at 20 s/div, one channel). Sample rates matched the time base (499/s at 500 ms/div, 123/s at
+2 s/div, 1247/s at 200 ms/div). With the calibrator aliased to a 5-sample pattern (200 ms/div: 0.8 ms interval), the pattern
+held over 27 582 samples per channel across 1.68 buffer wraps with four channels, including the deinterleave and the wrap
+of the read address; the only deviations are one-sample flips about every 3000 samples where an edge lands on the threshold
+because the sample clock drifts slightly against the calibrator. The first ~11-16 frames after the start are stale RAM and
+are dropped (as in the normal capture). If the host does not read for longer than the RAM takes to fill, data is lost and
+the pointer alone cannot say so; the library estimates it from the elapsed time and returns an overrun error.
+

@@ -38,6 +38,7 @@ cargo run -p hantek6xx4-cli -- ranges
 cargo run -p hantek6xx4-cli -- capture --channels 1,2 --vdiv 1V --timebase 200us
 cargo run -p hantek6xx4-cli -- capture --normal --trigger-level 128 --format csv -o capture.csv
 cargo run -p hantek6xx4-cli -- capture --channels 4 --normal --trigger-type pulse --pulse-width 500us --pulse-cond eq
+cargo run -p hantek6xx4-cli -- roll --channels 2 --timebase 25 --duration 20 --format csv   # scan/roll streaming
 cargo run -p hantek6xx4-cli -- raw bulk "06 00" --read 16      # protocol exploration
 cargo run -p hantek6xx4-cli -- dump-calibration cal.bin         # read only
 cargo run -p hantek6xx4-cli -- dump-amp-calibration amp.bin  # read only: factory gain trims (0xA2/0x1B00)

@@ -155,3 +155,56 @@ fn normal_sweep_times_out_without_trigger() {
     });
     assert!(matches!(r, Err(hantek6xx4_lib::Error::Timeout(_))));
 }
+
+fn status_reply(end: u16) -> Vec<u8> {
+    let mut s = vec![0u8; 512];
+    s[2..4].copy_from_slice(&end.to_le_bytes());
+    s
+}
+
+#[test]
+fn roll_streams_new_samples_and_handles_wraparound() {
+    let mut scope = Scope::new(mock()).unwrap();
+    let mut cfg = Config::default();
+    for (i, c) in cfg.channels.iter_mut().enumerate() {
+        c.enabled = i == 1; // one channel, 1 byte per frame
+    }
+    cfg.timebase = "500ms".parse().unwrap();
+    cfg.trigger.source = Channel::Ch2;
+    scope.configure(&cfg).unwrap();
+    assert!(scope.poll_roll().is_err(), "poll before start_roll");
+
+    // start: pointer at 0xffe0, 16 stale frames to drop
+    scope.transport_mut_for_test().push_bulk_in(status_reply(0xffe0));
+    scope.start_roll().unwrap();
+    assert!(scope.transport().bulk_writes().contains(&vec![0x03, 0x00, 0x03, 0x00]));
+
+    // first poll: pointer moved by 0x30 across the wrap to 0x0010; 48 bytes, the first 16 frames are stale
+    let m = scope.transport_mut_for_test();
+    m.push_bulk_in(status_reply(0x0010));
+    m.push_bulk_in((0..48u8).collect());
+    let f = scope.poll_roll().unwrap();
+    assert_eq!(
+        f.channel(Channel::Ch2).unwrap(),
+        (16..48u8).collect::<Vec<_>>().as_slice()
+    );
+    let w = scope.transport().bulk_writes();
+    assert!(
+        w.contains(&vec![0x0e, 0, 0xe0, 0xff]),
+        "readback starts at the old pointer"
+    );
+    assert!(w.contains(&vec![0x05, 0, 24, 0]), "48 bytes = 24 words");
+
+    // second poll: 8 more bytes, stale frames already dropped
+    let m = scope.transport_mut_for_test();
+    m.push_bulk_in(status_reply(0x0018));
+    m.push_bulk_in((100..108u8).collect());
+    let f = scope.poll_roll().unwrap();
+    assert_eq!(f.channel(Channel::Ch2).unwrap().len(), 8);
+    assert!(scope.transport().bulk_writes().contains(&vec![0x0e, 0, 0x10, 0x00]));
+
+    // nothing new: empty frame, no readback
+    scope.transport_mut_for_test().push_bulk_in(status_reply(0x0018));
+    let f = scope.poll_roll().unwrap();
+    assert!(f.channel(Channel::Ch2).is_none());
+}

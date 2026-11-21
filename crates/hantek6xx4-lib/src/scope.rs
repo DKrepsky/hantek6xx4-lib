@@ -30,6 +30,19 @@ pub struct Scope<T: Transport> {
     info: ScopeInfo,
     pcb_revision: u32,
     config: Config,
+    roll: Option<RollState>,
+}
+
+/// Frames at the start of a fresh acquisition that still hold old RAM contents (as in [`Scope::capture`]).
+const STALE_FRAMES: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+struct RollState {
+    /// Capture RAM byte address up to which data has been delivered.
+    pointer: u16,
+    last_poll: Instant,
+    /// Stale frames at the start of the acquisition still to be dropped.
+    skip_frames: usize,
 }
 
 impl Scope<UsbTransport> {
@@ -85,6 +98,7 @@ impl<T: Transport> Scope<T> {
             },
             pcb_revision,
             config: Config::default(),
+            roll: None,
         })
     }
 
@@ -267,7 +281,24 @@ impl<T: Transport> Scope<T> {
         } else {
             0
         };
-        self.send(&p::cmd_set_read_address(start as u16))?;
+        let data = self.read_ram(start as u16, bytes)?;
+
+        let skip = if state.triggered() {
+            0
+        } else {
+            16.min(cfg.buffer_len as usize)
+        };
+        let samples = Self::deinterleave(&cfg, &data, skip);
+
+        let trigger_sample = state
+            .triggered()
+            .then(|| p::pre_trigger_samples(cfg.buffer_len, cfg.trigger.horizontal_position_percent) as usize);
+        Ok(Self::make_frame(&cfg, samples, state.triggered(), trigger_sample))
+    }
+
+    /// Read `bytes` bytes of the capture RAM starting at byte address `start`.
+    fn read_ram(&mut self, start: u16, bytes: usize) -> Result<Vec<u8>> {
+        self.send(&p::cmd_set_read_address(start))?;
         self.send(&p::cmd_readback(bytes as u32))?;
         let mut data = Vec::with_capacity(bytes);
         while data.len() < bytes {
@@ -280,12 +311,12 @@ impl<T: Transport> Scope<T> {
             }
             data.extend_from_slice(&chunk);
         }
+        Ok(data)
+    }
 
-        let skip = if state.triggered() {
-            0
-        } else {
-            16.min(cfg.buffer_len as usize)
-        };
+    /// Split interleaved RAM bytes into per-channel samples, dropping the first `skip` frames.
+    fn deinterleave(cfg: &Config, data: &[u8], skip: usize) -> [Vec<u8>; MAX_CHANNELS] {
+        let stride = p::frame_stride(cfg.enabled_count());
         let mut samples: [Vec<u8>; MAX_CHANNELS] = Default::default();
         let enabled: Vec<usize> = (0..MAX_CHANNELS).filter(|&i| cfg.channels[i].enabled).collect();
         for (j, &ch) in enabled.iter().enumerate() {
@@ -293,26 +324,95 @@ impl<T: Transport> Scope<T> {
             let offset = if stride == 4 { ch } else { j };
             samples[ch] = data.iter().skip(offset).step_by(stride).skip(skip).copied().collect();
         }
+        samples
+    }
 
-        let k = p::channel_mode(n, cfg.timebase);
-        let trigger_sample = state
-            .triggered()
-            .then(|| p::pre_trigger_samples(cfg.buffer_len, cfg.trigger.horizontal_position_percent) as usize);
+    /// Build a [`Frame`] around already deinterleaved samples.
+    fn make_frame(
+        cfg: &Config,
+        samples: [Vec<u8>; MAX_CHANNELS],
+        triggered: bool,
+        trigger_sample: Option<usize>,
+    ) -> Frame {
+        let k = p::channel_mode(cfg.enabled_count(), cfg.timebase);
         let mut volts_per_div = [0.0; MAX_CHANNELS];
         let mut zero_code = [0.0; MAX_CHANNELS];
         for (i, c) in cfg.channels.iter().enumerate().take(MAX_CHANNELS) {
             volts_per_div[i] = c.volts_per_div.volts();
             zero_code[i] = crate::types::zero_code_for_position(c.position, c.volts_per_div, k);
         }
-        Ok(Frame {
+        Frame {
             samples,
             volts_per_div,
             zero_code,
             counts_per_div: crate::types::counts_per_div(k),
             sample_interval_ns: p::sample_interval_ns(cfg.timebase, k),
-            triggered: state.triggered(),
+            triggered,
             trigger_sample,
-        })
+        }
+    }
+
+    // ---- scan / roll streaming -----------------------------------------------------------
+
+    /// Start a continuous acquisition for scan/roll style display and remember where the capture RAM write pointer is.
+    ///
+    /// The hardware keeps writing into a 64 KiB circular buffer; [`Scope::poll_roll`] returns the samples added since
+    /// the previous call. The vendor software uses this for time bases of 500 ms/div (scan) and 2 s/div (roll) and
+    /// slower, but the mechanism works at any time base as long as the buffer is read before it wraps.
+    pub fn start_roll(&mut self) -> Result<()> {
+        if self.config.enabled_count() == 0 {
+            return Err(Error::invalid("scope has not been configured"));
+        }
+        // flags: bit 0 auto, bit 1 roll (no visible difference in the pointer behaviour on a 6254BC)
+        self.send(&[0x03, 0x00, 0x03, 0x00])?;
+        let status = BufferStatus::parse(&self.query(&p::CMD_BUFFER_STATUS)?)?;
+        self.roll = Some(RollState {
+            pointer: status.end_address & !7,
+            last_poll: Instant::now(),
+            skip_frames: STALE_FRAMES,
+        });
+        Ok(())
+    }
+
+    /// Samples acquired since [`Scope::start_roll`] or the previous poll (possibly none).
+    ///
+    /// Poll more often than the 64 KiB buffer fills: `65536 * sample_interval / channel_stride` (131 s for one channel
+    /// at 2 ms/sample). When the elapsed time since the previous poll says the buffer may have wrapped, the pointer is
+    /// resynchronised and [`Error::Overrun`] is returned; the next poll continues from the newest data.
+    pub fn poll_roll(&mut self) -> Result<Frame> {
+        let cfg = self.config.clone();
+        let state = self
+            .roll
+            .ok_or_else(|| Error::invalid("start_roll has not been called"))?;
+        let stride = p::frame_stride(cfg.enabled_count());
+        let status = BufferStatus::parse(&self.query(&p::CMD_BUFFER_STATUS)?)?;
+        let interval_ns = p::sample_interval_ns(cfg.timebase, p::channel_mode(cfg.enabled_count(), cfg.timebase));
+        let predicted = state.last_poll.elapsed().as_secs_f64() * 1e9 / interval_ns * stride as f64;
+        if predicted >= 65536.0 * 0.95 {
+            self.roll = Some(RollState {
+                pointer: status.end_address & !7,
+                last_poll: Instant::now(),
+                skip_frames: 0,
+            });
+            return Err(Error::Overrun);
+        }
+        let delta = (status.end_address.wrapping_sub(state.pointer)) as usize;
+        let step = if stride == 1 { 2 } else { stride };
+        let usable = delta - delta % step;
+        let data = if usable > 0 {
+            self.read_ram(state.pointer, usable)?
+        } else {
+            Vec::new()
+        };
+        let frames = usable / stride;
+        let skip = state.skip_frames.min(frames);
+        self.roll = Some(RollState {
+            pointer: state.pointer.wrapping_add(usable as u16),
+            last_poll: Instant::now(),
+            skip_frames: state.skip_frames - skip,
+        });
+        let samples = Self::deinterleave(&cfg, &data, skip);
+        Ok(Self::make_frame(&cfg, samples, false, None))
     }
 
     /// Disarm any running acquisition.
