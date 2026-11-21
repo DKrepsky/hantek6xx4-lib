@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::protocol::{self as p, AmpCalibration, BufferStatus, Calibration, SpiChip, State};
-use crate::transport::{Transport, UsbTransport};
+use crate::transport::{DeviceInfo, Transport, UsbTransport};
 use crate::types::{Config, Frame, ScopeInfo, Sweep, TriggerKind, MAX_CHANNELS};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,12 @@ impl Scope<UsbTransport> {
     /// Open and initialise the `n`-th connected scope.
     pub fn open_nth(n: usize) -> Result<Self> {
         Self::new(UsbTransport::open_nth(n)?)
+    }
+
+    /// Open and initialise the scope at a given bus position, for example one reported by a
+    /// [`DeviceEvent::Connected`](crate::DeviceEvent::Connected).
+    pub fn open_device(info: DeviceInfo) -> Result<Self> {
+        Self::new(UsbTransport::open_device(info)?)
     }
 }
 

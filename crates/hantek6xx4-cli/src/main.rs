@@ -3,8 +3,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hantek6xx4_lib::{
-    CaptureOptions, Channel, ChannelConfig, Config, Coupling, PulseCondition, Scope, Slope, Sweep, TimeBase, Transport,
-    TriggerKind, UsbTransport, VideoStandard, VideoSync, VoltsPerDiv,
+    CaptureOptions, Channel, ChannelConfig, Config, Coupling, DeviceEvent, DeviceMonitor, MonitorOptions,
+    PulseCondition, Scope, Slope, Sweep, TimeBase, Transport, TriggerKind, UsbTransport, VideoStandard, VideoSync,
+    VoltsPerDiv,
 };
 use std::io::Write;
 use std::time::Duration;
@@ -39,6 +40,22 @@ enum Cmd {
     },
     /// Configure the scope and capture one frame
     Capture(CaptureArgs),
+    /// Print a line whenever a scope is plugged in or removed
+    Watch {
+        /// Stop after this many seconds (default: run until interrupted)
+        #[arg(long)]
+        duration: Option<f64>,
+        /// Poll the device list instead of using libusb hotplug notifications
+        #[arg(long)]
+        polling: bool,
+        /// Polling interval in milliseconds (with --polling)
+        #[arg(long, default_value_t = 500)]
+        poll_ms: u64,
+        /// Report a new scope only after it has stayed connected this long (0 reports every appearance; a scope
+        /// re-enumerates about 1.2 s after power-up)
+        #[arg(long, default_value_t = 2000)]
+        settle_ms: u64,
+    },
     /// Stream samples continuously (scan/roll style) and print them as they arrive
     Roll {
         #[command(flatten)]
@@ -351,6 +368,12 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Capture(a) => capture(cli.device, a)?,
+        Cmd::Watch {
+            duration,
+            polling,
+            poll_ms,
+            settle_ms,
+        } => watch(duration, polling, poll_ms, settle_ms)?,
         Cmd::Roll {
             capture,
             duration,
@@ -419,6 +442,31 @@ fn build_config(a: &CaptureArgs) -> Result<Config> {
     };
 
     Ok(cfg)
+}
+
+/// Print connect and disconnect events with the time since the start.
+fn watch(duration: Option<f64>, polling: bool, poll_ms: u64, settle_ms: u64) -> Result<()> {
+    let start = std::time::Instant::now();
+    let handler = move |event: DeviceEvent| {
+        let (what, info) = match event {
+            DeviceEvent::Connected(i) => ("connected   ", i),
+            DeviceEvent::Disconnected(i) => ("disconnected", i),
+        };
+        println!("{:8.3}s {what} {info}", start.elapsed().as_secs_f64());
+    };
+    let options = MonitorOptions {
+        settle: Duration::from_millis(settle_ms),
+        polling: polling.then(|| Duration::from_millis(poll_ms)),
+    };
+    let monitor = DeviceMonitor::start_with(options, handler)?;
+    eprintln!("watching for scopes ({:?}); press Ctrl-C to stop", monitor.mode());
+    match duration {
+        Some(secs) => std::thread::sleep(Duration::from_secs_f64(secs)),
+        None => loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        },
+    }
+    Ok(())
 }
 
 /// Stream samples: CSV rows (`time_ns` then one column per enabled channel) or one summary line per poll.

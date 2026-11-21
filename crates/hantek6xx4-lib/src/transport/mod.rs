@@ -6,7 +6,7 @@ mod mock;
 mod usb;
 
 pub use mock::{Call, MockTransport};
-pub use usb::{UsbTransport, PID, VID};
+pub use usb::{DeviceInfo, UsbTransport, PID, VID};
 
 /// Minimal set of USB operations the scope needs (vendor control requests plus two bulk pipes).
 pub trait Transport {

@@ -15,6 +15,7 @@
 //! - raw 8-bit samples and conversion to volts ([`Frame::volts`]), with the per-unit factory calibration of the
 //!   device applied
 //! - continuous scan/roll streaming ([`Scope::start_roll`], [`Scope::poll_roll`])
+//! - notifications when a scope is plugged in or removed ([`DeviceMonitor`], [`DeviceEvent`])
 //!
 //! Not implemented: the arbitrary waveform generator (the 6254BC has none), serial-bus triggers (CAN, LIN, UART, SPI,
 //! I2C), and any write to the device EEPROM or FPGA flash.
@@ -64,12 +65,14 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod hotplug;
 pub mod protocol;
 pub mod scope;
 pub mod transport;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use hotplug::{DeviceEvent, DeviceMonitor, MonitorMode, MonitorOptions};
 pub use scope::{CaptureOptions, Scope};
-pub use transport::{MockTransport, Transport, UsbTransport};
+pub use transport::{DeviceInfo, MockTransport, Transport, UsbTransport};
 pub use types::*;

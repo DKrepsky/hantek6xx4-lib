@@ -5,9 +5,12 @@ use std::fmt;
 /// Everything that can go wrong while talking to the scope.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Low-level USB failure (permissions, unplugged device, stall, ...).
+    /// Low-level USB failure (permissions, stall, ...). An unplugged device is reported as [`Error::Disconnected`].
     #[error("USB error: {0}")]
-    Usb(#[from] rusb::Error),
+    Usb(rusb::Error),
+    /// The device was unplugged (or lost power) while it was in use.
+    #[error("the device was disconnected")]
+    Disconnected,
     /// No supported device is connected.
     #[error("no Hantek 6xx4 device found (is it plugged in and is the udev rule installed?)")]
     NotFound,
@@ -31,7 +34,22 @@ pub enum Error {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<rusb::Error> for Error {
+    fn from(e: rusb::Error) -> Self {
+        match e {
+            rusb::Error::NoDevice => Error::Disconnected,
+            e => Error::Usb(e),
+        }
+    }
+}
+
 impl Error {
+    /// True if the error means the device is gone, so the application should drop its [`Scope`](crate::Scope) and wait
+    /// for the device to come back (see [`DeviceMonitor`](crate::DeviceMonitor)).
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self, Error::Disconnected)
+    }
+
     pub(crate) fn invalid(msg: impl fmt::Display) -> Self {
         Error::InvalidParameter(msg.to_string())
     }

@@ -64,6 +64,13 @@ enumerates; no firmware upload is needed (unlike the Hantek 6022).
 | `0x02` | OUT | bulk | 512 bytes (64 if not high speed) |
 | `0x86` | IN | bulk | 512 bytes (64 if not high speed) |
 
+**Enumeration after power-up.** After the cable is plugged in, the scope enumerates, disappears from the bus about 1.2 s
+later (1.13 to 1.16 s measured) and enumerates again with a new device address, and it is stable from then on. Both
+enumerations carry the ID `04b5:6cde`. Commands sent during that window fail with an I/O error, and in one test
+opening the scope right after the first enumeration was followed by the scope not enumerating at all until it was
+replugged (the cause was not isolated). Wait for the scope to be stable (the library's `DeviceMonitor` waits 2 s) before
+opening it. A transfer to a scope that has been unplugged fails with `LIBUSB_ERROR_NO_DEVICE`.
+
 ### 2.2 Vendor control requests
 
 All use `bmRequestType` vendor, `wIndex = 0`.

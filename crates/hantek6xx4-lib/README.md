@@ -9,6 +9,7 @@ on hardware. Not affiliated with or endorsed by Hantek.
 - edge, pulse-width and video triggers
 - raw samples or volts, with the device's factory gain calibration applied
 - continuous scan/roll streaming
+- connect/disconnect events (`DeviceMonitor`), with `Error::Disconnected` for a scope that is removed while in use
 - a scriptable mock transport, so the driver can be tested without hardware
 - never writes the device EEPROM or FPGA flash
 

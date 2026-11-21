@@ -22,6 +22,7 @@ hardware.
 | Triggers | edge, pulse width (greater, less, equal, not equal), video; auto and normal sweep; trigger position |
 | Data | raw 8-bit samples or volts, with the factory gain calibration of the device applied |
 | Streaming | continuous scan/roll acquisition |
+| Hotplug | connect and disconnect events (`DeviceMonitor`), with a settle time that hides the scope's power-up re-enumeration |
 | Tooling | CLI with CSV/raw export and calibration backup, scriptable mock transport for tests |
 
 Known limits: the video trigger has not been tested with a video signal; volts are verified from 50 mV to 1 V per
@@ -67,6 +68,7 @@ hantek6xx4 capture --channels 1,2 --vdiv 1V --timebase 200us --volts
 hantek6xx4 capture --normal --trigger-level 128 --format csv -o capture.csv
 hantek6xx4 capture --channels 4 --normal --trigger-type pulse --pulse-width 500us --pulse-cond eq
 hantek6xx4 roll --channels 2 --timebase 25 --duration 20 --format csv
+hantek6xx4 watch                                       # print a line whenever a scope is plugged in or removed
 hantek6xx4 dump-calibration cal.bin                    # read-only backups of the factory tables
 hantek6xx4 dump-amp-calibration amp.bin
 hantek6xx4 raw bulk "06 00" --read 16                  # low-level access for protocol work
