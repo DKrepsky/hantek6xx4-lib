@@ -4,7 +4,9 @@
 //! behaviour verified on a real 6254BC (see `docs/protocol.md`).
 
 use crate::error::{Error, Result};
-use crate::types::{ChannelConfig, Coupling, Slope, Sweep, TimeBase};
+use crate::types::{
+    ChannelConfig, Coupling, PulseCondition, Slope, Sweep, TimeBase, TriggerKind, VideoStandard, VideoSync,
+};
 
 // ---- control requests -------------------------------------------------------------------------
 
@@ -388,9 +390,96 @@ pub fn cmd_trigger_level(level: u8) -> [u8; 26] {
     p
 }
 
+/// Trigger mode command (`0x11`, DC trigger coupling): mode 0 = edge, 1 = pulse, 2 = video.
+pub fn cmd_trigger_mode(mode: u8, slope: Slope) -> [u8; 6] {
+    [0x11, 0x00, mode, (slope == Slope::Falling) as u8, 0x00, 0x00]
+}
+
 /// Edge trigger mode command (DC trigger coupling).
 pub fn cmd_trigger_mode_edge(slope: Slope) -> [u8; 6] {
-    [0x11, 0x00, 0x00, (slope == Slope::Falling) as u8, 0x00, 0x00]
+    cmd_trigger_mode(0, slope)
+}
+
+/// Trigger mode byte of a trigger kind.
+pub fn trigger_mode_byte(kind: &TriggerKind) -> u8 {
+    match kind {
+        TriggerKind::Edge => 0,
+        TriggerKind::Pulse { .. } => 1,
+        TriggerKind::Video { .. } => 2,
+    }
+}
+
+/// Pulse trigger command (`0x13`, vendor `dsoHTSetPulseTriger`), sent after the mode command.
+///
+/// The width is counted in units of 8 ns (a 125 MHz counter): `a = trunc(width_ns * 0.125)`. The vendor documentation
+/// says the width argument is in units of 5 ns, which would give `a = width_ns / 40`; on a 6254BC that made the
+/// hardware see pulses five times too wide (a 500 us pulse compared as greater than 2.4 ms but not 2.5 ms, for any
+/// timebase), so the argument is in nanoseconds. The packet carries `a`, `1.05 a` and `0.95 a` (the tolerance window
+/// used by "equal") as little-endian 32-bit values and the condition shifted left by one.
+pub fn cmd_pulse_trigger(width_ns: u64, condition: PulseCondition) -> [u8; 16] {
+    let a = (width_ns as f64 * 0.125).trunc();
+    let upper = (a * 1.05).trunc() as u32;
+    let lower = (a * 0.95).trunc() as u32;
+    let cond: u8 = match condition {
+        PulseCondition::Equal => 0,
+        PulseCondition::NotEqual => 1,
+        PulseCondition::Greater => 2,
+        PulseCondition::Less => 3,
+    };
+    let mut p = [0u8; 16];
+    p[0] = 0x13;
+    p[2..6].copy_from_slice(&(a as u32).to_le_bytes());
+    p[6..10].copy_from_slice(&upper.to_le_bytes());
+    p[10..14].copy_from_slice(&lower.to_le_bytes());
+    p[14] = cond << 1;
+    p
+}
+
+/// Hardware line counter value for a 1-based video line number (vendor remapping, 16-bit arithmetic).
+pub fn video_line_counter(standard: VideoStandard, line: u16) -> u16 {
+    let l = line;
+    match standard {
+        VideoStandard::PalSecam => match l {
+            0..=5 => l * 2 + 0x134,
+            6..=0x136 => l + 0x13e,
+            0x137..=0x13e => (l * 2).wrapping_sub(0x125),
+            0x13f..=0x26e => l - 0x13f,
+            0x26f..=0x271 => (l * 2).wrapping_sub(0x3ae),
+            _ => l,
+        },
+        VideoStandard::Ntsc => match l {
+            0..=9 => l * 2 + 0xfc,
+            10..=0x107 => l + 0x106,
+            0x108..=0x10f => l * 2 - 1,
+            0x110..=0x20d => l - 0x110,
+            _ => l,
+        },
+    }
+}
+
+/// Video trigger command (`0x16`, vendor `dsoHTSetVideoTriger`), sent after the mode command.
+///
+/// `level` is the trigger level as an ADC code, as for the edge trigger. The packet carries the line counter, the sync
+/// selection, the level with +-2 hysteresis and fixed timing constants copied from the vendor code.
+pub fn cmd_video_trigger(standard: VideoStandard, sync: VideoSync, positive: bool, level: u8) -> [u8; 16] {
+    let (select, line) = match sync {
+        VideoSync::AllLines => (0u8, 1u16),
+        VideoSync::Line(n) => (1, n),
+        VideoSync::OddField => (2, 1),
+        VideoSync::EvenField => (3, 1),
+        VideoSync::AllFields => (4, 1),
+    };
+    let counter = video_line_counter(standard, line);
+    let mut p = [0u8; 16];
+    p[0] = 0x16;
+    p[2] = counter as u8;
+    p[3] = (((positive as u8) << 3 | (select & 7)) << 3) | ((counter >> 8) as u8 & 3);
+    p[4] = level.wrapping_add(2);
+    p[5] = level.wrapping_sub(2);
+    p[6..14].copy_from_slice(&[0x5b, 0x0e, 0x3b, 0x0d, 0x4b, 0x02, 0x2c, 0x01]);
+    p[14] = 0; // logic trigger source, unused
+    p[15] = 0x32;
+    p
 }
 
 /// Horizontal trigger position / pre-trigger length command.
@@ -808,5 +897,32 @@ mod tests {
         assert_eq!(cal.trim(0, 8, 4), 0);
         let d = AmpCalibration::default();
         assert_eq!(d.trim(3, 11, 2), AMP_UNITY);
+    }
+
+    #[test]
+    fn pulse_trigger_packet() {
+        // 500 us, "equal": a = 62500 units of 8 ns (0xf424), 1.05a = 65625 (0x10059), 0.95a = 59375 (0xe7ef)
+        let p = cmd_pulse_trigger(500_000, PulseCondition::Equal);
+        assert_eq!(p, [0x13, 0, 0x24, 0xf4, 0, 0, 0x59, 0, 1, 0, 0xef, 0xe7, 0, 0, 0, 0]);
+        assert_eq!(cmd_pulse_trigger(500_000, PulseCondition::Less)[14], 6);
+        assert_eq!(cmd_pulse_trigger(500_000, PulseCondition::Greater)[14], 4);
+        assert_eq!(cmd_pulse_trigger(500_000, PulseCondition::NotEqual)[14], 2);
+    }
+
+    #[test]
+    fn video_trigger_packet_and_line_counter() {
+        // PAL, all lines (line 1 -> counter 310 = 0x136), positive sync, level 128
+        let p = cmd_video_trigger(VideoStandard::PalSecam, VideoSync::AllLines, true, 128);
+        assert_eq!(
+            p,
+            [0x16, 0, 0x36, 0x41, 0x82, 0x7e, 0x5b, 0x0e, 0x3b, 0x0d, 0x4b, 0x02, 0x2c, 0x01, 0, 0x32]
+        );
+        assert_eq!(video_line_counter(VideoStandard::PalSecam, 1), 310);
+        assert_eq!(video_line_counter(VideoStandard::PalSecam, 6), 0x144);
+        assert_eq!(video_line_counter(VideoStandard::PalSecam, 0x140), 1);
+        assert_eq!(video_line_counter(VideoStandard::Ntsc, 1), 254);
+        assert_eq!(video_line_counter(VideoStandard::Ntsc, 0x110), 0);
+        assert_eq!(trigger_mode_byte(&TriggerKind::Edge), 0);
+        assert_eq!(cmd_trigger_mode(2, Slope::Falling), [0x11, 0, 2, 1, 0, 0]);
     }
 }

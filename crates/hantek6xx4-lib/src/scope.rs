@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::protocol::{self as p, AmpCalibration, BufferStatus, Calibration, SpiChip, State};
 use crate::transport::{Transport, UsbTransport};
-use crate::types::{Config, Frame, ScopeInfo, Sweep, MAX_CHANNELS};
+use crate::types::{Config, Frame, ScopeInfo, Sweep, TriggerKind, MAX_CHANNELS};
 use std::time::{Duration, Instant};
 
 /// Options for one acquisition.
@@ -205,7 +205,19 @@ impl<T: Transport> Scope<T> {
             self.transport.delay(10);
         }
         self.send(&p::cmd_trigger_level(cfg.trigger.level))?;
-        self.send(&p::cmd_trigger_mode_edge(cfg.trigger.slope))?;
+        self.send(&p::cmd_trigger_mode(
+            p::trigger_mode_byte(&cfg.trigger.kind),
+            cfg.trigger.slope,
+        ))?;
+        match cfg.trigger.kind {
+            TriggerKind::Edge => {}
+            TriggerKind::Pulse { width_ns, condition } => self.send(&p::cmd_pulse_trigger(width_ns, condition))?,
+            TriggerKind::Video {
+                standard,
+                sync,
+                positive,
+            } => self.send(&p::cmd_video_trigger(standard, sync, positive, cfg.trigger.level))?,
+        }
         // per-unit gain trim (vendor `dsoHTSetAmpCalibrate`)
         let amp = p::cmd_amp_calibration(
             &self.amp_calibration,

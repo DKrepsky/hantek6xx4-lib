@@ -186,11 +186,67 @@ impl Default for ChannelConfig {
     }
 }
 
-/// Edge trigger settings.
+/// Pulse width comparison of the pulse trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PulseCondition {
+    /// Width equal to the setting (the hardware accepts +-5 %).
+    Equal,
+    NotEqual,
+    /// Wider than the setting.
+    Greater,
+    /// Narrower than the setting.
+    Less,
+}
+
+/// Analog television standard of the video trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoStandard {
+    /// PAL and SECAM (625 lines).
+    PalSecam,
+    /// NTSC (525 lines).
+    Ntsc,
+}
+
+/// What the video trigger synchronises to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoSync {
+    AllLines,
+    /// One line number (1-based).
+    Line(u16),
+    OddField,
+    EvenField,
+    AllFields,
+}
+
+/// Kind of trigger.
+///
+/// Pulse and video triggers are implemented from the vendor code. The pulse trigger is verified on hardware with the
+/// 1 kHz calibrator; the video trigger has not been verified against a video signal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TriggerKind {
+    /// Edge on the configured slope.
+    Edge,
+    /// Pulse width trigger; the slope selects positive (rising) or negative (falling) pulses.
+    Pulse {
+        /// Pulse width in nanoseconds, 10 ns to 10 s.
+        width_ns: u64,
+        condition: PulseCondition,
+    },
+    /// Video trigger.
+    Video {
+        standard: VideoStandard,
+        sync: VideoSync,
+        /// True for positive sync polarity.
+        positive: bool,
+    },
+}
+
+/// Trigger settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TriggerConfig {
     /// Channel to trigger on (must be enabled).
     pub source: Channel,
+    pub kind: TriggerKind,
     pub slope: Slope,
     pub sweep: Sweep,
     /// Trigger threshold as an ADC code (0..=228); it is compared with the raw sample values.
@@ -203,6 +259,7 @@ impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
             source: Channel::Ch1,
+            kind: TriggerKind::Edge,
             slope: Slope::Rising,
             sweep: Sweep::Auto,
             level: 128,
@@ -254,6 +311,22 @@ impl Config {
         }
         if self.trigger.level > 0xE4 {
             return Err(Error::invalid("trigger level must be 0..=228"));
+        }
+        match self.trigger.kind {
+            TriggerKind::Edge => {}
+            TriggerKind::Pulse { width_ns, .. } => {
+                if !(10..=10_000_000_000).contains(&width_ns) {
+                    return Err(Error::invalid("pulse width must be 10 ns to 10 s"));
+                }
+            }
+            TriggerKind::Video { standard, sync, .. } => {
+                if let VideoSync::Line(n) = sync {
+                    let max = if standard == VideoStandard::PalSecam { 625 } else { 525 };
+                    if !(1..=max).contains(&n) {
+                        return Err(Error::invalid(format!("video line must be 1..={max}")));
+                    }
+                }
+            }
         }
         if !(0.0..=100.0).contains(&self.trigger.horizontal_position_percent) {
             return Err(Error::invalid("horizontal position must be 0..=100 %"));

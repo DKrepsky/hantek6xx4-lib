@@ -3,8 +3,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hantek6xx4_lib::{
-    CaptureOptions, Channel, ChannelConfig, Config, Coupling, Scope, Slope, Sweep, TimeBase, Transport, UsbTransport,
-    VoltsPerDiv,
+    CaptureOptions, Channel, ChannelConfig, Config, Coupling, PulseCondition, Scope, Slope, Sweep, TimeBase, Transport,
+    TriggerKind, UsbTransport, VideoStandard, VideoSync, VoltsPerDiv,
 };
 use std::io::Write;
 use std::time::Duration;
@@ -78,6 +78,61 @@ enum Format {
     Raw,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TriggerType {
+    Edge,
+    Pulse,
+    /// Implemented from the vendor code; not verified against a video signal
+    Video,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PulseCond {
+    /// Equal (+-5 %)
+    Eq,
+    Ne,
+    /// Wider than
+    Gt,
+    /// Narrower than
+    Lt,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum VideoStd {
+    Pal,
+    Ntsc,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum VideoSyncArg {
+    AllLines,
+    Line,
+    Odd,
+    Even,
+    AllFields,
+}
+
+/// Parse a duration such as "500us", "20ns", "1.5ms" or "2s" into nanoseconds.
+fn parse_duration_ns(s: &str) -> Result<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    let (num, mult) = if let Some(n) = s.strip_suffix("ns") {
+        (n, 1.0)
+    } else if let Some(n) = s.strip_suffix("us") {
+        (n, 1e3)
+    } else if let Some(n) = s.strip_suffix("ms") {
+        (n, 1e6)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1e9)
+    } else {
+        bail!("duration '{s}' needs a unit: ns, us, ms or s");
+    };
+    let v: f64 = num.trim().parse().map_err(|e| anyhow!("bad duration '{s}': {e}"))?;
+    if !(v.is_finite() && v >= 0.0) {
+        bail!("bad duration '{s}'");
+    }
+    Ok((v * mult).round() as u64)
+}
+
 #[derive(Args)]
 struct CaptureArgs {
     /// Channels to enable, e.g. "1" or "1,3,4"
@@ -104,9 +159,30 @@ struct CaptureArgs {
     /// Trigger level as ADC code 0..228
     #[arg(long, default_value_t = 128)]
     trigger_level: u8,
-    /// Use the falling edge
+    /// Use the falling edge (for the pulse trigger: negative pulses)
     #[arg(long)]
     falling: bool,
+    /// Trigger type
+    #[arg(long, value_enum, default_value_t = TriggerType::Edge)]
+    trigger_type: TriggerType,
+    /// Pulse trigger width, e.g. 500us, 20ns, 1.5ms, 2s (10ns..10s)
+    #[arg(long)]
+    pulse_width: Option<String>,
+    /// Pulse trigger condition
+    #[arg(long, value_enum, default_value_t = PulseCond::Eq)]
+    pulse_cond: PulseCond,
+    /// Video standard
+    #[arg(long, value_enum, default_value_t = VideoStd::Pal)]
+    video_standard: VideoStd,
+    /// Video sync
+    #[arg(long, value_enum, default_value_t = VideoSyncArg::AllLines)]
+    video_sync: VideoSyncArg,
+    /// Video line number for --video-sync line (1-based)
+    #[arg(long, default_value_t = 1)]
+    video_line: u16,
+    /// Negative video sync polarity (default positive)
+    #[arg(long)]
+    video_negative: bool,
     /// Wait for a trigger instead of free running
     #[arg(long)]
     normal: bool,
@@ -291,6 +367,36 @@ fn capture(device: usize, a: CaptureArgs) -> Result<()> {
     cfg.trigger.slope = if a.falling { Slope::Falling } else { Slope::Rising };
     cfg.trigger.sweep = if a.normal { Sweep::Normal } else { Sweep::Auto };
     cfg.trigger.horizontal_position_percent = a.hpos;
+    cfg.trigger.kind = match a.trigger_type {
+        TriggerType::Edge => TriggerKind::Edge,
+        TriggerType::Pulse => TriggerKind::Pulse {
+            width_ns: parse_duration_ns(
+                a.pulse_width
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--pulse-width is required"))?,
+            )?,
+            condition: match a.pulse_cond {
+                PulseCond::Eq => PulseCondition::Equal,
+                PulseCond::Ne => PulseCondition::NotEqual,
+                PulseCond::Gt => PulseCondition::Greater,
+                PulseCond::Lt => PulseCondition::Less,
+            },
+        },
+        TriggerType::Video => TriggerKind::Video {
+            standard: match a.video_standard {
+                VideoStd::Pal => VideoStandard::PalSecam,
+                VideoStd::Ntsc => VideoStandard::Ntsc,
+            },
+            sync: match a.video_sync {
+                VideoSyncArg::AllLines => VideoSync::AllLines,
+                VideoSyncArg::Line => VideoSync::Line(a.video_line),
+                VideoSyncArg::Odd => VideoSync::OddField,
+                VideoSyncArg::Even => VideoSync::EvenField,
+                VideoSyncArg::AllFields => VideoSync::AllFields,
+            },
+            positive: !a.video_negative,
+        },
+    };
 
     let mut scope = open(device)?;
     scope.configure(&cfg)?;

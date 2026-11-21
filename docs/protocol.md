@@ -660,3 +660,27 @@ a reference. The scale comes from one unit.
   consistent with the verified clock, including the 1 GS/s one channel mode and the 500 MS/s two channel mode at
   500 ns/div. Sample amplitudes in modes 1 and 2 are lower than in mode 4 (see 10.8).
 
+### 10.10 Pulse and video triggers
+
+Both follow the trigger mode command `11 00 mode slope couple 00` (mode 0 edge, 1 pulse, 2 video; slope 0 rising or
+positive, 1 falling or negative; coupling byte 0 = DC) with a second packet. The library sends them at the end of
+`configure`, after the trigger level.
+
+**Pulse (`0x13`, 16 bytes) — VERIFIED on the 6254BC with the 1 kHz calibrator (500 us pulses):**
+`13 00 | a u32 | 1.05a u32 | 0.95a u32 | cond << 1 | 00`, where `a = trunc(width_ns * 0.125)` (units of 8 ns) and cond is
+0 equal, 1 not equal, 2 greater, 3 less. The vendor header documents the width in units of 5 ns, which would give
+`ns / 40`; with that the hardware saw pulses five times too wide (Greater triggered up to a 2.4 ms setting and not at
+2.5 ms for a 500 us pulse, at 20 us, 200 us and 1 ms per division alike), so the vendor argument is effectively in
+nanoseconds and the counter runs at 125 MHz. With the fix, all 14 test cases behave: Equal triggers for 480-520 us (the
++-5 % window) and not at 450 or 560 us; Greater/Less/Not equal trigger only when the real width is wider/narrower/different;
+positive and negative pulses (`slope`) both work. The capture is aligned to the start of the pulse (the edge that begins it),
+like an edge trigger.
+
+**Video (`0x16`, 16 bytes) — implemented from the vendor code, NOT verified with a video signal:**
+`16 00 | line counter low | ((positive << 3 | sync) << 3) | counter bits 9..8 | level + 2 | level - 2 | 5b 0e 3b 0d 4b 02 2c 01 |
+logic source (0) | 32`. The 1-based line number is remapped to the hardware counter (PAL/SECAM: `2n+0x134` for n<6,
+`n+0x13e` up to 0x136, `2n-0x125` up to 0x13e, `n-0x13f` up to 0x26e, `2n-0x3ae` up to 0x271; NTSC: `2n+0xfc` for n<10,
+`n+0x106` up to 0x107, `2n-1` up to 0x10f, `n-0x110` up to 0x20d). Sync select: 0 all lines, 1 line number, 2 odd field,
+3 even field, 4 all fields (the line number is 1 for the modes that do not use one). On the calibrator the device accepts
+the command, never triggers (it is not a video signal) and an edge capture works normally afterwards.
+
