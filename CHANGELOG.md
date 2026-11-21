@@ -5,6 +5,16 @@ and the project follows [Semantic Versioning](https://semver.org/) (while below 
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/DKrepsky/hantek6xx4-lib/compare/v0.1.0...v0.2.0) - 2026-11-21
+
+### Added
+
+- [**breaking**] add DeviceMonitor for connect/disconnect events and Error::Disconnected
+
+### Fixed
+
+- [**breaking**] mark Error as non_exhaustive
+
 ## [0.1.0]
 
 First release. Developed and verified on a Hantek 6254BC (USB `04b5:6cde`, PCB P1.06, FPGA `0xd001`).
