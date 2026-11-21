@@ -185,8 +185,7 @@ impl<T: Transport> Scope<T> {
             false,
         ))?;
         // positions
-        for ch in 0..MAX_CHANNELS {
-            let c = &cfg.channels[ch];
+        for (ch, c) in cfg.channels.iter().enumerate().take(MAX_CHANNELS) {
             let word = self
                 .calibration
                 .position_word(ch, c.volts_per_div.index(), k, c.position);
