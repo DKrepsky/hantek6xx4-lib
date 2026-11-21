@@ -170,7 +170,7 @@ pub struct ChannelConfig {
     pub volts_per_div: VoltsPerDiv,
     pub coupling: Coupling,
     pub bandwidth_limit: bool,
-    /// Vertical position, 0..=255. Zero volts is at ADC code `31 + position * 193 / 255` (about 128 for the default 128).
+    /// Vertical position, 0..=255. Zero volts is at ADC code 128 for the default 128 (see [`zero_code_for_position`]).
     pub position: u8,
 }
 
@@ -280,15 +280,22 @@ pub struct ScopeInfo {
     pub fpga_version: u16,
 }
 
-/// ADC counts per vertical division, measured on a 6254BC against its 2 Vpp probe-compensation output
-/// (92.1 counts at 500 mV/div and 46.0 counts at 1 V/div, so 23.0). The vendor SDK demos assume 255/8 = 32, which
-/// would read the calibrator as 1.5 V. Not verified against an external reference or on other units.
-pub const COUNTS_PER_DIV: f64 = 23.0;
+/// ADC counts per vertical division, measured on a 6254BC against a 0.994 V DC source (multimeter): 24.15 counts per
+/// division from 200 mV to 1 V per division, at several positions. The vendor SDK demos assume 255/8 = 32. The unit's
+/// 1 kHz calibrator then reads about 1.9 V, not the nominal 2 V. Not verified on other units or below 200 mV/div.
+pub const COUNTS_PER_DIV: f64 = 24.15;
 
-/// ADC code of 0 V for a vertical position `0..=255`, measured on a 6254BC for all V/div: 31 at position 0,
-/// about 128 at 128 and 224 at 255 (a slope of 193/255 codes per position step).
-pub fn zero_code_for_position(position: u8) -> f64 {
-    31.0 + f64::from(position) * 193.0 / 255.0
+/// ADC code of 0 V for a vertical position `0..=255`, as measured on a 6254BC with a shorted input.
+///
+/// Position 128 is code 128. The span over the whole position range is 31..=224 for most ranges, but only
+/// 89..=166 for 50 mV, 500 mV and 5 V per division (indexes 4, 7 and 10).
+pub fn zero_code_for_position(position: u8, volts_per_div: VoltsPerDiv) -> f64 {
+    let p = f64::from(position);
+    if matches!(volts_per_div.index(), 4 | 7 | 10) {
+        89.0 + p * 77.0 / 255.0
+    } else {
+        31.0 + p * 193.0 / 255.0
+    }
 }
 
 /// One acquisition.
@@ -383,8 +390,12 @@ mod volts_tests {
         assert_eq!(v[0], 0.0);
         assert!((v[1] - 23.0 / COUNTS_PER_DIV).abs() < 1e-12);
         assert!((v[2] + 23.0 / COUNTS_PER_DIV).abs() < 1e-12);
-        assert!((zero_code_for_position(0) - 31.0).abs() < 1e-9);
-        assert!((zero_code_for_position(255) - 224.0).abs() < 1e-9);
+        let v1 = VoltsPerDiv::V1;
+        assert!((zero_code_for_position(0, v1) - 31.0).abs() < 1e-9);
+        assert!((zero_code_for_position(255, v1) - 224.0).abs() < 1e-9);
+        let v500m = VoltsPerDiv::from_index(7).unwrap();
+        assert!((zero_code_for_position(0, v500m) - 89.0).abs() < 1e-9);
+        assert!((zero_code_for_position(255, v500m) - 166.0).abs() < 1e-9);
         assert!(frame.volts(Channel::Ch2).is_none());
     }
 }

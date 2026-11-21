@@ -602,18 +602,21 @@ Remaining open: volts-per-count scale (needs a known voltage or `0xA2/0x1B00` de
 ### 10.7 Counts to volts
 
 The vendor SDK demos assume `volts = (code - (255 - position)) * 8 * V/div / 255`, i.e. 32 counts per division and a
-zero code of `255 - position`. **That does not hold on the 6254BC**: it reads the 2 Vpp calibrator as 1.5 V.
-Measured instead (calibrator on CH2):
+zero code of `255 - position`. **That does not hold on the 6254BC.** Measured instead:
 
-- Counts per division: the two plateaus of the calibrator are 92.1 counts apart at 500 mV/div and 46.0 at 1 V/div, so
-  **23.0 counts per division** (calibrator taken as 2.00 V; 2 V/5 V/10 V per division agree within quantisation).
-  The vendor position scale `(pos - 128) * 0.78125 + 128.5` (0.78125 = 200/256) hints at a design value of about 25.
-- Zero level versus position (all 12 V/div, shorted input): code 31 at position 0, about 128 at 128, 224 at 255, i.e.
-  `31 + position * 193 / 255`, not `255 - position`.
+- **Counts per division: 24.15.** Reference: a 0.994 V DC source (multimeter) on CH2 with CH1 shorted as the zero
+  reference. 120.1 counts at 200 mV/div, 48.0 at 500 mV/div and 24.0 at 1 V/div, at positions 0, 128 and 255, all give
+  24.1 to 24.2. The vendor position scale `(pos - 128) * 0.78125 + 128.5` hints at a design value of about 25. The
+  unit's 1 kHz calibrator (plateaus 92.1 counts apart at 500 mV/div, 46.0 at 1 V/div) then reads about 1.9 V, not
+  the nominal 2 V. Ranges of 2 V/div and above have only a few counts of signal and could not confirm the scale.
+- **Zero code versus position** (shorted input, all 12 V/div): code 128 at position 128 everywhere. At position 0 and 255
+  it is 31 and 224 for most ranges (`31 + pos * 193 / 255`) but 89 and 166 for V/div indexes 4, 7 and 10 (50 mV, 500 mV,
+  5 V; `89 + pos * 77 / 255`). At 2 mV/div position 0 reads 0 (clipped).
+
+With these constants the DC source reads 0.99 to 1.00 V from 200 mV to 1 V per division at several positions.
 
 `dsoHTSetAmpCalibrate` does not feed this: it sends a 26-byte command `0x1E` with per-channel offset words
 `trunc(p' * (1024 - t) + 0.5)` where `p' = trunc((pos - 128) * 0.78125 + 128.5)` and `t` comes from the amplitude table
 (`0xA2/0x1B00`, default `0x400` = skip). This command is not implemented in the library yet and is not needed for
-capture. The scale is derived from one unit and the calibrator's nominal voltage; per-unit gain differences and the
-sub-200 mV ranges (no suitable signal) are unverified. The zero-versus-position line is linear but can be off by a few
-counts (about 0.1 V at 1 V/div) away from the default position 128.
+capture. The scale comes from one unit; ranges below 200 mV/div and above 1 V/div, per-unit gain differences and the
+`0x1B00` table remain unverified.

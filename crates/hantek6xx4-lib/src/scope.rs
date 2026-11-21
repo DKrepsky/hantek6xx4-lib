@@ -269,7 +269,7 @@ impl<T: Transport> Scope<T> {
         let mut zero_code = [0.0; MAX_CHANNELS];
         for (i, c) in cfg.channels.iter().enumerate().take(MAX_CHANNELS) {
             volts_per_div[i] = c.volts_per_div.volts();
-            zero_code[i] = crate::types::zero_code_for_position(c.position);
+            zero_code[i] = crate::types::zero_code_for_position(c.position, c.volts_per_div);
         }
         Ok(Frame {
             samples,
