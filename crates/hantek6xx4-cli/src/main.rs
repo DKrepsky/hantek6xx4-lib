@@ -32,6 +32,11 @@ enum Cmd {
         /// Output file (raw little-endian 16-bit words)
         file: String,
     },
+    /// Read the factory amplitude (gain trim) table and save it (read-only backup)
+    DumpAmpCalibration {
+        /// Output file (raw little-endian 16-bit words, followed by the 0xFACF validity word)
+        file: String,
+    },
     /// Configure the scope and capture one frame
     Capture(CaptureArgs),
     /// Send raw commands (low level, for protocol exploration)
@@ -200,6 +205,25 @@ fn main() -> Result<()> {
             let bytes: Vec<u8> = s.calibration().words().iter().flat_map(|w| w.to_le_bytes()).collect();
             std::fs::write(&file, bytes)?;
             println!("wrote {} words to {file}", s.calibration().words().len());
+        }
+        Cmd::DumpAmpCalibration { file } => {
+            let s = open(cli.device)?;
+            let words = s.amp_calibration().words();
+            let bytes: Vec<u8> = words
+                .iter()
+                .copied()
+                .chain(std::iter::once(hantek6xx4_lib::protocol::AMP_FLAG))
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            std::fs::write(&file, bytes)?;
+            let trimmed = words
+                .iter()
+                .filter(|&&w| w != hantek6xx4_lib::protocol::AMP_UNITY)
+                .count();
+            println!(
+                "wrote {} words to {file} ({trimmed} differ from unity)",
+                words.len() + 1
+            );
         }
         Cmd::Ranges => {
             println!(
