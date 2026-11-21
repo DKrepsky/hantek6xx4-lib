@@ -1,7 +1,7 @@
 //! High-level scope handle: initialisation, configuration and acquisition.
 
 use crate::error::{Error, Result};
-use crate::protocol::{self as p, BufferStatus, Calibration, SpiChip, State};
+use crate::protocol::{self as p, AmpCalibration, BufferStatus, Calibration, SpiChip, State};
 use crate::transport::{Transport, UsbTransport};
 use crate::types::{Config, Frame, ScopeInfo, Sweep, MAX_CHANNELS};
 use std::time::{Duration, Instant};
@@ -26,6 +26,7 @@ pub struct Scope<T: Transport> {
     transport: T,
     packet_size: usize,
     calibration: Calibration,
+    amp_calibration: AmpCalibration,
     info: ScopeInfo,
     pcb_revision: u32,
     config: Config,
@@ -59,6 +60,11 @@ impl<T: Transport> Scope<T> {
         let pcb_revision = p::parse_pcb_revision(raw_info.get(14..20).unwrap_or(&[]));
         let cal_bytes = transport.control_in(p::REQ_AREA, p::AREA_CALIBRATION, p::CAL_WORDS * 2)?;
         let calibration = Calibration::from_bytes(&cal_bytes)?;
+        let amp_bytes = transport.control_in(p::REQ_AREA, p::AREA_AMPLITUDE, (p::AMP_WORDS + 1) * 2)?;
+        let amp_calibration = AmpCalibration::from_bytes(&amp_bytes).unwrap_or_else(|| {
+            log::warn!("amplitude calibration table invalid, using no gain trim");
+            AmpCalibration::default()
+        });
 
         for (chip, reg, value, sleep) in p::INIT_SEQUENCE {
             Self::send_raw(&mut transport, &mut packet_size, &p::spi_write(chip, reg, value))?;
@@ -69,6 +75,7 @@ impl<T: Transport> Scope<T> {
             transport,
             packet_size,
             calibration,
+            amp_calibration,
             info: ScopeInfo {
                 raw_info,
                 name,
@@ -89,6 +96,11 @@ impl<T: Transport> Scope<T> {
     /// The calibration table read from the device.
     pub fn calibration(&self) -> &Calibration {
         &self.calibration
+    }
+
+    /// The per-unit gain trims read from the device.
+    pub fn amp_calibration(&self) -> &AmpCalibration {
+        &self.amp_calibration
     }
 
     /// The configuration last applied with [`Scope::configure`].
@@ -194,6 +206,15 @@ impl<T: Transport> Scope<T> {
         }
         self.send(&p::cmd_trigger_level(cfg.trigger.level))?;
         self.send(&p::cmd_trigger_mode_edge(cfg.trigger.slope))?;
+        // per-unit gain trim (vendor `dsoHTSetAmpCalibrate`)
+        let amp = p::cmd_amp_calibration(
+            &self.amp_calibration,
+            mask,
+            k,
+            cfg.channels.map(|c| c.volts_per_div.index()),
+            cfg.channels.map(|c| c.position),
+        );
+        self.send(&amp)?;
         self.config = cfg.clone();
         Ok(())
     }
@@ -269,12 +290,13 @@ impl<T: Transport> Scope<T> {
         let mut zero_code = [0.0; MAX_CHANNELS];
         for (i, c) in cfg.channels.iter().enumerate().take(MAX_CHANNELS) {
             volts_per_div[i] = c.volts_per_div.volts();
-            zero_code[i] = crate::types::zero_code_for_position(c.position, c.volts_per_div);
+            zero_code[i] = crate::types::zero_code_for_position(c.position, c.volts_per_div, k);
         }
         Ok(Frame {
             samples,
             volts_per_div,
             zero_code,
+            counts_per_div: crate::types::counts_per_div(k),
             sample_interval_ns: p::sample_interval_ns(cfg.timebase, k),
             triggered: state.triggered(),
             trigger_sample,

@@ -280,22 +280,37 @@ pub struct ScopeInfo {
     pub fpga_version: u16,
 }
 
-/// ADC counts per vertical division, measured on a 6254BC against a 0.994 V DC source (multimeter): 24.15 counts per
-/// division from 200 mV to 1 V per division, at several positions. The vendor SDK demos assume 255/8 = 32. The unit's
-/// 1 kHz calibrator then reads about 1.9 V, not the nominal 2 V. Not verified on other units or below 200 mV/div.
-pub const COUNTS_PER_DIV: f64 = 24.15;
-
-/// ADC code of 0 V for a vertical position `0..=255`, as measured on a 6254BC with a shorted input.
+/// ADC counts per vertical division in ADC channel mode `k` (1, 2 or 4; see `protocol::channel_mode`).
 ///
-/// Position 128 is code 128. The span over the whole position range is 31..=224 for most ranges, but only
-/// 89..=166 for 50 mV, 500 mV and 5 V per division (indexes 4, 7 and 10).
-pub fn zero_code_for_position(position: u8, volts_per_div: VoltsPerDiv) -> f64 {
-    let p = f64::from(position);
-    if matches!(volts_per_div.index(), 4 | 7 | 10) {
-        89.0 + p * 77.0 / 255.0
-    } else {
-        31.0 + p * 193.0 / 255.0
+/// Measured on one 6254BC against a 0.994 V DC source (multimeter), 200 mV to 1 V per division, with the factory
+/// gain trim applied: 24.15 in four channel mode, about 21.6 in two channel mode and about 21.1 in one channel
+/// mode (the fast timebases). The vendor SDK demos assume 255/8 = 32 for all. Not verified on other units, below
+/// 200 mV or above 1 V per division.
+pub fn counts_per_div(k: u8) -> f64 {
+    match k {
+        1 => 21.1,
+        2 => 21.6,
+        _ => 24.15,
     }
+}
+
+/// ADC code of 0 V for a vertical position `0..=255` in channel mode `k`, as measured on a 6254BC with shorted input.
+///
+/// Position 128 is code 128 in every mode. The position control spans 8 divisions, so at position 0 and 255 the code is
+/// about 31 and 224 in four channel mode, 39 and 216 in two channel mode, and 43 and 212 in one channel mode. The
+/// ranges 50 mV, 500 mV and 5 V per division (indexes 4, 7 and 10) have a narrower span: 89 and 166, 92 and 162, and
+/// 99 and 156.
+pub fn zero_code_for_position(position: u8, volts_per_div: VoltsPerDiv, k: u8) -> f64 {
+    let narrow = matches!(volts_per_div.index(), 4 | 7 | 10);
+    let (lo, hi) = match (k, narrow) {
+        (1, false) => (43.0, 212.0),
+        (1, true) => (99.0, 156.0),
+        (2, false) => (39.0, 216.0),
+        (2, true) => (92.0, 162.0),
+        (_, false) => (31.0, 224.0),
+        (_, true) => (89.0, 166.0),
+    };
+    lo + f64::from(position) * (hi - lo) / 255.0
 }
 
 /// One acquisition.
@@ -307,6 +322,8 @@ pub struct Frame {
     pub volts_per_div: [f64; MAX_CHANNELS],
     /// ADC code that corresponds to 0 V for each channel (see [`zero_code_for_position`]).
     pub zero_code: [f64; MAX_CHANNELS],
+    /// ADC counts per division of this capture (see [`counts_per_div`]).
+    pub counts_per_div: f64,
     /// Time between samples in nanoseconds.
     pub sample_interval_ns: f64,
     /// True if the hardware trigger fired.
@@ -328,11 +345,11 @@ impl Frame {
 
     /// Convert one raw ADC code of `ch` to volts at the input (the probe attenuation is not applied).
     ///
-    /// Uses `(code - zero) * V/div / COUNTS_PER_DIV`. The scale was measured against the 2 Vpp calibrator of one
-    /// 6254BC (see [`COUNTS_PER_DIV`]); per-unit gain differences are not corrected.
+    /// Uses `(code - zero) * V/div / counts_per_div`. The scale was measured on one 6254BC (see [`counts_per_div`]);
+    /// the factory gain trim read from the device is applied by the driver, other per-unit differences are not.
     pub fn code_to_volts(&self, ch: Channel, code: u8) -> f64 {
         let i = ch.index();
-        (f64::from(code) - self.zero_code[i]) * self.volts_per_div[i] / COUNTS_PER_DIV
+        (f64::from(code) - self.zero_code[i]) * self.volts_per_div[i] / self.counts_per_div
     }
 
     /// Samples of one channel converted to volts, if it was enabled.
@@ -382,20 +399,23 @@ mod volts_tests {
             samples: [vec![128, 151, 105], vec![], vec![], vec![]],
             volts_per_div: [1.0, 1.0, 1.0, 1.0],
             zero_code: [128.0, 128.0, 128.0, 128.0],
+            counts_per_div: 23.0,
             sample_interval_ns: 1.0,
             triggered: false,
             trigger_sample: None,
         };
         let v = frame.volts(Channel::Ch1).unwrap();
         assert_eq!(v[0], 0.0);
-        assert!((v[1] - 23.0 / COUNTS_PER_DIV).abs() < 1e-12);
-        assert!((v[2] + 23.0 / COUNTS_PER_DIV).abs() < 1e-12);
+        assert!((v[1] - 1.0).abs() < 1e-12);
+        assert!((v[2] + 1.0).abs() < 1e-12);
         let v1 = VoltsPerDiv::V1;
-        assert!((zero_code_for_position(0, v1) - 31.0).abs() < 1e-9);
-        assert!((zero_code_for_position(255, v1) - 224.0).abs() < 1e-9);
+        assert!((zero_code_for_position(0, v1, 4) - 31.0).abs() < 1e-9);
+        assert!((zero_code_for_position(255, v1, 4) - 224.0).abs() < 1e-9);
+        assert!((zero_code_for_position(0, v1, 1) - 43.0).abs() < 1e-9);
         let v500m = VoltsPerDiv::from_index(7).unwrap();
-        assert!((zero_code_for_position(0, v500m) - 89.0).abs() < 1e-9);
-        assert!((zero_code_for_position(255, v500m) - 166.0).abs() < 1e-9);
+        assert!((zero_code_for_position(0, v500m, 2) - 92.0).abs() < 1e-9);
+        assert!((zero_code_for_position(255, v500m, 4) - 166.0).abs() < 1e-9);
+        assert!(counts_per_div(1) < counts_per_div(2) && counts_per_div(2) < counts_per_div(4));
         assert!(frame.volts(Channel::Ch2).is_none());
     }
 }

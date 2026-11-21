@@ -16,6 +16,13 @@ fn mock() -> MockTransport {
                 v[6..10].copy_from_slice(b"6000");
                 v[14..19].copy_from_slice(b"P1.06");
             }
+            (0xA2, 0x1B00) => {
+                // amplitude table: unity except CH1, row 7 (500 mV), four channel slot = 0x440
+                let mut words = vec![0x400u16; 289];
+                words[7 * 6 + 2] = 0x440;
+                words[288] = 0xFACF;
+                v = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            }
             (0xA2, 0x1600) => {
                 let mut words = vec![0u16; CAL_WORDS];
                 words[CAL_WORDS - 1] = CAL_FLAG;
@@ -79,6 +86,11 @@ fn configure_emits_verified_packets() {
     assert!(has(&[0, 0, 0x71, 0x71]), "CH1 position word 29041");
     assert!(has(&[8, 0, 0, 0x3f, 0, 0x55, 4, 0]), "ADC gain register for PCB 1.06");
     assert!(has(&[0x11, 0, 0, 0, 0, 0]), "edge rising");
+    // default config is 4 channels at 1 V/div (row 7): CH1 carries the 0x440 trim, the others none
+    let amp = w.iter().find(|x| x[0] == 0x1e).expect("amplitude calibration packet");
+    assert_eq!(amp.len(), 26);
+    assert_eq!(&amp[2..10], &[0x40, 0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x04]);
+    assert!(amp[10..14] != [0, 0, 0, 0] && amp[14..].iter().all(|&b| b == 0));
     let h = w.iter().find(|x| x[0] == 0x10).unwrap();
     assert_eq!(h.len(), 14);
 }

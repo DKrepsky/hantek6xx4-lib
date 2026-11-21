@@ -25,6 +25,15 @@ pub const CAL_WORDS: usize = 577;
 /// Value of the last calibration word when the table is valid.
 pub const CAL_FLAG: u16 = 0xFBCF;
 
+/// wValue of the amplitude (gain trim) table.
+pub const AREA_AMPLITUDE: u16 = 0x1B00;
+/// Number of 16-bit words in the amplitude table, not counting the validity flag: 4 channels x 12 rows x 6 slots.
+pub const AMP_WORDS: usize = 288;
+/// Value of the word after the amplitude table when it is valid.
+pub const AMP_FLAG: u16 = 0xFACF;
+/// Trim value meaning "no correction" (1.0 in 1/1024 units).
+pub const AMP_UNITY: u16 = 0x400;
+
 /// The 10-byte payload of the `0xB3` preamble request (mode 1).
 pub fn preamble() -> [u8; 10] {
     let mut p = [0u8; 10];
@@ -417,6 +426,109 @@ pub fn pre_trigger_samples(buffer_len: u32, percent: f64) -> u32 {
     (percent * buffer_len as f64 * 0.01).floor() as u32
 }
 
+// ---- amplitude (gain trim) calibration ----------------------------------------------------------
+
+/// Per-unit gain trims stored in the device (`0xA2/0x1B00`), in 1/1024 units (`0x400` = 1.0).
+///
+/// Indexed by channel, row (the volts/div index remapped to 5, 7 or 9 for 0..=5, 6..=8 and 9..=11) and slot
+/// (0 = one channel mode, 1 = two channel mode, 2 = four channel mode). The factory fills in the rows that matter;
+/// the rest stay at `0x400`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmpCalibration {
+    words: Vec<u16>,
+}
+
+impl Default for AmpCalibration {
+    /// A table without any correction.
+    fn default() -> Self {
+        Self {
+            words: vec![AMP_UNITY; AMP_WORDS],
+        }
+    }
+}
+
+impl AmpCalibration {
+    /// Parse the bytes of an amplitude table read (at least `(AMP_WORDS + 1) * 2`). Returns `None` when the validity flag
+    /// is wrong or the read is short; the vendor software then uses no correction either.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < (AMP_WORDS + 1) * 2 {
+            return None;
+        }
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .take(AMP_WORDS + 1)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if words[AMP_WORDS] != AMP_FLAG {
+            return None;
+        }
+        Some(Self {
+            words: words[..AMP_WORDS].to_vec(),
+        })
+    }
+
+    /// The raw words (without the flag).
+    pub fn words(&self) -> &[u16] {
+        &self.words
+    }
+
+    /// Trim of channel `ch` (0..=3) for volts/div index `v` and channel mode `k` (1, 2 or 4).
+    pub fn trim(&self, ch: usize, v: u8, k: u8) -> u16 {
+        let row = match v {
+            0..=5 => 5,
+            6..=8 => 7,
+            _ => 9,
+        };
+        let slot = match k {
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        self.words[(ch * 12 + row) * 6 + slot]
+    }
+}
+
+/// The 26-byte amplitude calibration command (`0x1E`, vendor `dsoHTSetAmpCalibrate`).
+///
+/// `mask` is the enabled-channel bitmask, `k` the channel mode, `vdiv` the volts/div index and `position` the 0..=255
+/// vertical position of each channel. The header carries four trims; for each trim other than unity the packet also
+/// carries an offset correction `trunc(p' * (1024 - t) + 0.5)` with `p' = trunc((position - 128) * 0.78125 + 128.5)`
+/// that keeps the zero level in place when the gain changes. Which channel supplies the trim and position of each
+/// slot follows the vendor code: one channel mode uses the enabled channel for all four, two channel mode uses the
+/// first enabled channel's trim for all four and its position for the first pair, the second's for the second pair.
+pub fn cmd_amp_calibration(cal: &AmpCalibration, mask: u8, k: u8, vdiv: [u8; 4], position: [u8; 4]) -> [u8; 26] {
+    let enabled: Vec<usize> = (0..4).filter(|i| mask >> i & 1 != 0).collect();
+    let (trims, pos): ([u16; 4], [u8; 4]) = match k {
+        1 => {
+            let e = enabled.first().copied().unwrap_or(0);
+            ([cal.trim(e, vdiv[e], 1); 4], [position[e]; 4])
+        }
+        2 => {
+            let f = enabled.first().copied().unwrap_or(0);
+            let s = enabled.get(1).copied().unwrap_or(f);
+            (
+                [cal.trim(f, vdiv[f], 2); 4],
+                [position[f], position[f], position[s], position[s]],
+            )
+        }
+        _ => ([0, 1, 2, 3].map(|i| cal.trim(i, vdiv[i], 4)), position),
+    };
+    let mut out = [0u8; 26];
+    out[0] = 0x1e;
+    for i in 0..4 {
+        out[2 + 2 * i..4 + 2 * i].copy_from_slice(&trims[i].to_le_bytes());
+        if trims[i] != AMP_UNITY {
+            let scaled = ((f64::from(pos[i]) - 128.0) * 0.78125 + 128.5).trunc();
+            let mut g = (scaled * (1024.0 - f64::from(trims[i])) + 0.5).trunc() as i64;
+            if g < 0 {
+                g += 0x200_0000;
+            }
+            out[10 + 4 * i..14 + 4 * i].copy_from_slice(&(g as u32).to_le_bytes());
+        }
+    }
+    out
+}
+
 // ---- calibration and position -----------------------------------------------------------------
 
 /// The calibration table stored in the device.
@@ -668,5 +780,33 @@ mod tests {
         assert!(State::parse(&[0x02, 0xc4]).unwrap().data_ready());
         assert_eq!(frame_stride(3), 4);
         assert_eq!(frame_stride(2), 2);
+    }
+
+    #[test]
+    fn amp_calibration_packet_matches_hardware_experiment() {
+        // CH2 only, 500 mV/div (row 7), trim 0x440, position 128: verified on a 6254BC (gain x1.0625, zero unchanged)
+        let mut words = vec![AMP_UNITY; AMP_WORDS];
+        words[(12 + 7) * 6] = 0x440;
+        let cal = AmpCalibration { words };
+        let pkt = cmd_amp_calibration(&cal, 0b0010, 1, [7; 4], [128; 4]);
+        let expected: [u8; 26] = [
+            0x1e, 0, 0x40, 4, 0x40, 4, 0x40, 4, 0x40, 4, 0x01, 0xe0, 0xff, 0x01, 0x01, 0xe0, 0xff, 0x01, 0x01, 0xe0,
+            0xff, 0x01, 0x01, 0xe0, 0xff, 0x01,
+        ];
+        assert_eq!(pkt, expected);
+        // unity everywhere: header only, no offset words
+        let none = cmd_amp_calibration(&AmpCalibration::default(), 0b0010, 1, [7; 4], [128; 4]);
+        assert!(none[10..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn amp_table_validity_and_rows() {
+        let mut b = vec![0u8; (AMP_WORDS + 1) * 2];
+        assert!(AmpCalibration::from_bytes(&b).is_none());
+        b[AMP_WORDS * 2..].copy_from_slice(&AMP_FLAG.to_le_bytes());
+        let cal = AmpCalibration::from_bytes(&b).unwrap();
+        assert_eq!(cal.trim(0, 8, 4), 0);
+        let d = AmpCalibration::default();
+        assert_eq!(d.trim(3, 11, 2), AMP_UNITY);
     }
 }

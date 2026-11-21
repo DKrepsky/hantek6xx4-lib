@@ -599,24 +599,40 @@ a DC offset to confirm.
 
 Remaining open: volts-per-count scale (needs a known voltage or `0xA2/0x1B00` decoding), AC coupling with a DC-offset signal, true 1 GS/s rate, pulse/video triggers, scan/roll, AWG, `0xEC/0xED/0xE3/0xF4`.
 
-### 10.7 Counts to volts
+### 10.7 Amplitude table (`0xA2/0x1B00`, per-unit gain trim) — VERIFIED
+
+Control read `0xA2`, wValue `0x1B00`, 578 bytes: 288 little-endian words (4 channels x 12 rows x 6 slots) followed by the
+flag word `0xFACF`. If the flag is wrong the vendor code uses no correction. Values are gain factors in 1/1024 units
+(`0x400` = 1.0). Rows are the V/div index remapped to 5 (idx 0-5), 7 (idx 6-8) or 9 (idx 9-11); only those rows (plus a few
+words of row 8) hold data. Slot 0, 1, 2 = ADC channel mode k = 1, 2, 4 (the other three slots stay `0x400`). On the 6254BC
+the trims are within a few percent, differ per channel (500 mV row, slot 0: CH1 `0x455`, CH2 `0x440`, CH3 `0x445`,
+CH4 `0x454`) and are near 1.0 in the four channel mode.
+
+The vendor applies the table with command `0x1E` (`dsoHTSetAmpCalibrate`), 26 bytes: `1e 00`, four trims as u16 LE
+(bytes 2..9), then for each trim other than `0x400` a 4-byte LE offset word `trunc(p' * (1024 - t) + 0.5)`
+(`+0x2000000` if negative) at bytes `10 + 4i`, with `p' = trunc((position - 128) * 0.78125 + 128.5)`. For one channel
+mode the single enabled channel supplies the trim and position for all four words; for two channel mode the first
+enabled channel's trim fills all four and positions are `[first, first, second, second]`; for four channel mode each
+channel uses its own. **Effect, verified on hardware:** the FPGA multiplies the samples by `t/1024` around the zero
+level (sending `0x440` for CH2 at 500 mV/div raised the signal above zero by 1.06x while the zero stayed at code 128). It
+persists across captures. The library sends it at the end of `configure`. Note that one enabled channel at a timebase
+index above 7 runs in ADC channel mode 4, so slot 2 applies there, not slot 0.
+
+### 10.8 Counts to volts
 
 The vendor SDK demos assume `volts = (code - (255 - position)) * 8 * V/div / 255`, i.e. 32 counts per division and a
-zero code of `255 - position`. **That does not hold on the 6254BC.** Measured instead:
+zero code of `255 - position`. **That does not hold on the 6254BC.** Measured instead, with a 0.994 V DC source
+(multimeter) on CH2 and CH1 shorted as the zero reference:
 
-- **Counts per division: 24.15.** Reference: a 0.994 V DC source (multimeter) on CH2 with CH1 shorted as the zero
-  reference. 120.1 counts at 200 mV/div, 48.0 at 500 mV/div and 24.0 at 1 V/div, at positions 0, 128 and 255, all give
-  24.1 to 24.2. The vendor position scale `(pos - 128) * 0.78125 + 128.5` hints at a design value of about 25. The
-  unit's 1 kHz calibrator (plateaus 92.1 counts apart at 500 mV/div, 46.0 at 1 V/div) then reads about 1.9 V, not
-  the nominal 2 V. Ranges of 2 V/div and above have only a few counts of signal and could not confirm the scale.
-- **Zero code versus position** (shorted input, all 12 V/div): code 128 at position 128 everywhere. At position 0 and 255
-  it is 31 and 224 for most ranges (`31 + pos * 193 / 255`) but 89 and 166 for V/div indexes 4, 7 and 10 (50 mV, 500 mV,
-  5 V; `89 + pos * 77 / 255`). At 2 mV/div position 0 reads 0 (clipped).
+| ADC channel mode k | counts per division | zero code at position 0 / 255 | same, ranges idx 4, 7, 10 |
+|---|---|---|---|
+| 4 (3-4 channels, slower timebases) | 24.15 | 31 / 224 | 89 / 166 |
+| 2 | about 21.6 | about 39 / 216 | 92 / 162 |
+| 1 (one channel, timebase idx < 7) | about 21.1 (with the factory trim) | about 43 / 212 | 99 / 156 |
 
-With these constants the DC source reads 0.99 to 1.00 V from 200 mV to 1 V per division at several positions.
-
-`dsoHTSetAmpCalibrate` does not feed this: it sends a 26-byte command `0x1E` with per-channel offset words
-`trunc(p' * (1024 - t) + 0.5)` where `p' = trunc((pos - 128) * 0.78125 + 128.5)` and `t` comes from the amplitude table
-(`0xA2/0x1B00`, default `0x400` = skip). This command is not implemented in the library yet and is not needed for
-capture. The scale comes from one unit; ranges below 200 mV/div and above 1 V/div, per-unit gain differences and the
-`0x1B00` table remain unverified.
+Position 128 is code 128 in every mode, and the zero span is 8 divisions in each mode (the position control always covers
++-4 divisions). Counts per division were checked from 200 mV to 1 V per division at several positions in mode 4 (24.1 to
+24.2), and at 500 mV and 1 V in the other modes. The 1 kHz calibrator then reads about 1.9 V, not the nominal 2 V.
+Zero levels vary by a few counts between ranges; the table gives typical values, so volts can be off by 2-3 counts
+(up to about 5 % of a division-scale reading) at extreme positions in the fast modes. Ranges below 200 mV/div and above
+1 V/div have not been checked against a reference. The scale comes from one unit.
