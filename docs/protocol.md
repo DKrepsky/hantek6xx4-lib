@@ -52,7 +52,7 @@ Read-only probe (Rust + rusb, only control reads, no writes):
 | ADC | Analog Devices HMCAD1511, 8-bit, 1 GS/s, 4 channels |
 | PLL / clock | Analog Devices ADF4360-7 |
 | Front end control | 74HC595 shift registers (one per channel): attenuator relays, AC/DC relay, bandwidth limit, ADC driver enable |
-| AWG DAC | TI DAC902E (12-bit) |
+| AWG DAC | TI DAC902E (12-bit), reported for the 6254BD in third-party teardowns; **the 6254BC unit used here has no generator output** (see 8.11) |
 | Capture memory | 64K |
 | Other | 24 MHz crystal, TLV274C op-amps, TPS63000 buck-boost (U38) |
 
@@ -382,9 +382,13 @@ Zero level: the demo's `SourceToDisplay` computes `sample − (255 − leverPos)
 Buffer lengths: `BUF_4K_LEN` (the demo reads 4096 samples). Scan (`dsoHTGetScanData`, timebase ≥ 25) and roll
 (`dsoHTGetRollData`, ≥ 27) modes use the same primitives with incremental reads.
 
-### 8.11 AWG / DDS (`dds*` exports, not yet decoded)
+### 8.11 AWG / DDS (`dds*` exports, not decoded, not implemented)
 
-The 6254BC has a DAC902E-based arbitrary generator. The SDK API is: `ddsSetOnOff`, `ddsSetFrequency`, `ddsDownload` (wave RAM, 12-bit points),
+**The 6254BC has no signal generator output** (confirmed on the unit used for this work), and its generator calibration
+areas are blank: `0xA2/0x1D80` reads all `0xFF`, and the DDS calibration word the vendor code expects at `0xA2/0x15E0`
+(`dsoGetDDSCali`, word 1) is `0xFFFF`, so the DLL would fall back to its default. The generator exists in the SDK because
+it is shared with other models (the DAC902E generator is reported for the 6254BD). The library does not implement it: it
+cannot be tested here and sending DDS commands to a device without the hardware has unknown effects on the FPGA. The SDK API is: `ddsSetOnOff`, `ddsSetFrequency`, `ddsDownload` (wave RAM, 12-bit points),
 `ddsSetCmd` (0 continuous / 4 burst / 1 single), `ddsSDKSetFre/Amp/Offset/BurstNum/WaveType (0 sin, 1 ramp, 2 square, 4 DC, 8 noise)/WavePhase/WaveDuty`,
 `ddsSetSweep`, `ddsSetFAOC`, `ddsSetSyncOut`, `ddsSetAMFMFreq`. Functions are at `0x100086a0`–`0x10009120` in the decompile for later work.
 
