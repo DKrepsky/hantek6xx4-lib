@@ -18,5 +18,5 @@ vendored = ["rusb/vendored"]
 
 [dependencies]
 rusb = "0.9"
-thiserror = "1"
+thiserror = "2"
 log = "0.4"
