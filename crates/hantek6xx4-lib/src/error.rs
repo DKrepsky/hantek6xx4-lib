@@ -3,7 +3,23 @@
 use std::fmt;
 
 /// Everything that can go wrong while talking to the scope.
+///
+/// The enum is `#[non_exhaustive]`: new variants can be added in minor releases, so a `match` needs a wildcard arm.
+///
+/// ```
+/// use hantek6xx4_lib::Error;
+///
+/// fn describe(e: &Error) -> &'static str {
+///     match e {
+///         Error::Disconnected => "unplugged: wait for the device to come back",
+///         Error::Timeout(_) => "no trigger or no answer in time",
+///         _ => "something else went wrong",
+///     }
+/// }
+/// assert_eq!(describe(&Error::NotFound), "something else went wrong");
+/// ```
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Low-level USB failure (permissions, stall, ...). An unplugged device is reported as [`Error::Disconnected`].
     #[error("USB error: {0}")]
