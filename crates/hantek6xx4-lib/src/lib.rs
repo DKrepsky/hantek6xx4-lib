@@ -56,9 +56,9 @@
 //!
 //! # Platform notes
 //!
-//! On Linux the user needs access to the USB device (a udev rule is in `contrib/` in the repository). The `rusb`
-//! backend uses the system `libusb-1.0`; enable the `vendored` feature to build libusb from source instead, which is
-//! the easiest way on Windows.
+//! Linux is the tested platform. The user needs access to the USB device there (a udev rule is in `contrib/` in the
+//! repository). The `rusb` backend uses the system `libusb-1.0`; enable the `vendored` feature to build libusb from
+//! source instead. Windows and macOS are untested.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

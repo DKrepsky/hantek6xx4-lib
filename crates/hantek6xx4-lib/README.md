@@ -24,8 +24,9 @@ let volts = frame.volts(Channel::Ch1).unwrap();
 # Ok::<(), hantek6xx4_lib::Error>(())
 ```
 
-On Linux the user needs access to the USB device (udev rule in the repository, `contrib/99-hantek6xx4.rules`).
-The crate uses the system `libusb-1.0`; enable the `vendored` feature to build it from source instead.
+Linux is the tested platform; there the user needs access to the USB device (udev rule in the repository,
+`contrib/99-hantek6xx4.rules`). The crate uses the system `libusb-1.0`; enable the `vendored` feature to build it from
+source instead. Windows and macOS are untested.
 Minimum supported Rust version: 1.74. The companion command line tool is
 [`hantek6xx4-cli`](https://crates.io/crates/hantek6xx4-cli).
 

@@ -17,7 +17,7 @@ hantek6xx4 dump-amp-calibration amp.bin
 
 `hantek6xx4 <command> --help` lists all options. Build requirements, Linux access rights (udev rule) and the protocol
 specification are described in the
-[repository README](https://github.com/DKrepsky/hantek6xx4-lib#readme). Minimum supported Rust version: 1.85; use
-`--features vendored` where no system libusb is available.
+[repository README](https://github.com/DKrepsky/hantek6xx4-lib#readme). Linux is the tested platform. Minimum supported
+Rust version: 1.85; use `--features vendored` where no system libusb is available.
 
 License: MIT.

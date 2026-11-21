@@ -38,10 +38,10 @@ example the 6254BD) are untested. The driver never writes the device EEPROM or F
 
 ## Installation
 
-Build requirements: a Rust toolchain (library 1.74 or newer, CLI 1.85 or newer). The `rusb` backend uses the system
-`libusb-1.0`; on Linux install its development package (`libusb-1.0-0-dev` and `pkg-config` on Debian and Ubuntu).
-Where no system libusb is available, for example on Windows, build with `--features vendored` to compile libusb from
-source.
+Linux is the supported and tested platform. Build requirements: a Rust toolchain (library 1.74 or newer, CLI 1.85 or
+newer) and the system `libusb-1.0` with its development files (`libusb-1.0-0-dev` and `pkg-config` on Debian and Ubuntu).
+`rusb` is cross-platform, so other systems may work, but Windows and macOS are not tested; there, or wherever no system
+libusb is available, build with `--features vendored` to compile libusb from source.
 
 ```sh
 cargo install hantek6xx4-cli          # installs the `hantek6xx4` binary
@@ -105,7 +105,7 @@ The `dump-*` commands only read.
 
 - [Protocol specification](docs/protocol.md): transport, commands, configuration model, calibration, verification status
 - [Research notes](docs/research/README.md): how the protocol was obtained and the probes used
-- [Changelog](CHANGELOG.md), [release checklist](RELEASING.md)
+- [Changelog](CHANGELOG.md)
 
 ## Development
 
@@ -117,6 +117,15 @@ cargo test --all
 
 Hardware is not needed for the tests. Contributions that add support for other models or verify untested features on
 other units are welcome; please include captures or measurements with the pull request.
+
+### Releases
+
+Releases are automated with [release-plz](https://release-plz.dev); do not bump the version or edit `CHANGELOG.md`
+by hand. Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
+`fix:` and breaking changes (`feat!:` or a `BREAKING CHANGE:` footer) trigger a release, while `docs:`, `ci:`, `chore:`
+and `test:` do not. On every push to `main` the workflow opens or updates a release pull request with the version bump
+and changelog; merging it publishes both crates to crates.io (token: the `CARGO_REGISTRY_TOKEN` secret of the `release`
+environment), tags `vX.Y.Z` and creates the GitHub release. All GitHub Actions are pinned to full commit SHAs.
 
 ## Acknowledgements
 
