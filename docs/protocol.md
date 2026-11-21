@@ -633,9 +633,17 @@ zero code of `255 - position`. **That does not hold on the 6254BC.** Measured in
 Position 128 is code 128 in every mode, and the zero span is 8 divisions in each mode (the position control always covers
 +-4 divisions). Counts per division were checked from 200 mV to 1 V per division at several positions in mode 4 (24.1 to
 24.2), and at 500 mV and 1 V in the other modes. The 1 kHz calibrator then reads about 1.9 V, not the nominal 2 V.
-Zero levels vary by a few counts between ranges; the table gives typical values, so volts can be off by 2-3 counts
-(up to about 5 % of a division-scale reading) at extreme positions in the fast modes. Ranges below 200 mV/div and above
-1 V/div have not been checked against a reference. The scale comes from one unit.
+Zero levels vary by a few counts between ranges and between channels (a shorted CH4 sat 2 counts above a shorted CH1 at
+200 mV/div); the table gives typical values, so volts can be off by 2-3 counts (up to about 5 % of a division-scale
+reading) at extreme positions in the fast modes.
+
+Second check with a 0.298 V DC source on CH2 (a load across the source was needed to keep it steady) and a shorted CH4 as
+the zero reference, medians of two captures: 50 mV/div (position 0) gives 24.0 counts per division in mode 4, 21.5-21.6 in
+mode 2 and 21.3 in mode 1; 100 mV/div gives 23.8, 21.8 and 20.5-20.8. These agree with the table above to 1-3 %, and the
+library's volts read 0.294-0.301 V for 0.298 V. At 200 mV and 500 mV/div the signal is only 11-33 counts, so quantisation
+dominates. Open inputs are not a zero reference: at 100 mV/div an open CH1 and CH3 showed a square wave (12 counts
+peak-to-peak) coupled from the calibrator on CH4. Ranges below 50 mV/div and above 1 V/div have not been checked against
+a reference. The scale comes from one unit.
 
 ### 10.9 AC coupling and sample clock — VERIFIED (CH2 on a 0.994 V DC source, CH4 on the 1 kHz calibrator)
 
