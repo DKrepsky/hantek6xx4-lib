@@ -268,12 +268,16 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Info => {
-            let s = open(cli.device)?;
+            let mut s = open(cli.device)?;
             let i = s.info();
             println!("family:       {}", i.name);
             println!("PCB revision: {}", i.pcb_version);
             println!("serial field: {}", i.serial);
             println!("FPGA version: 0x{:04x}", i.fpga_version);
+            if let Some(v) = s.driver_version() {
+                println!("driver ver:   {v}");
+            }
+            let i = s.info();
             println!("raw info:\n{}", hexdump(&i.raw_info));
             println!("calibration:  valid ({} words)", s.calibration().words().len());
         }

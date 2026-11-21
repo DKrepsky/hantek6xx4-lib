@@ -107,6 +107,16 @@ impl<T: Transport> Scope<T> {
         &self.info
     }
 
+    /// The driver (firmware) version as 8 BCD digits, a date such as `"20160531"` on a 6254BC (vendor
+    /// `dsoGetDriverVersion`, request `0xE3`). Returns `None` when the firmware does not answer or the digits are invalid.
+    pub fn driver_version(&mut self) -> Option<String> {
+        let raw = self
+            .transport
+            .control_in(p::REQ_DRIVER_VERSION, p::AREA_DRIVER_VERSION, 4)
+            .ok()?;
+        p::parse_driver_version(&raw)
+    }
+
     /// The calibration table read from the device.
     pub fn calibration(&self) -> &Calibration {
         &self.calibration

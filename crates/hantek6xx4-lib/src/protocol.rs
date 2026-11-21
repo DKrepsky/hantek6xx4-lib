@@ -20,6 +20,28 @@ pub const REQ_AREA: u8 = 0xA2;
 pub const AREA_INFO: u16 = 0x1580;
 /// Length of the info string.
 pub const INFO_LEN: usize = 0x47;
+/// Request that reads the driver (firmware) version.
+pub const REQ_DRIVER_VERSION: u8 = 0xE3;
+/// wValue of the driver version.
+pub const AREA_DRIVER_VERSION: u16 = 0x15F0;
+
+/// Decode the 4 BCD bytes returned by the driver version read into its 8 digits (`"20160531"` on a 6254BC).
+pub fn parse_driver_version(raw: &[u8]) -> Option<String> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let mut out = String::with_capacity(8);
+    for &b in &raw[..4] {
+        for nibble in [b >> 4, b & 0x0f] {
+            if nibble > 9 {
+                return None;
+            }
+            out.push((b'0' + nibble) as char);
+        }
+    }
+    Some(out)
+}
+
 /// wValue of the calibration table.
 pub const AREA_CALIBRATION: u16 = 0x1600;
 /// Number of 16-bit words in the calibration table including the validity flag.
@@ -924,5 +946,15 @@ mod tests {
         assert_eq!(video_line_counter(VideoStandard::Ntsc, 0x110), 0);
         assert_eq!(trigger_mode_byte(&TriggerKind::Edge), 0);
         assert_eq!(cmd_trigger_mode(2, Slope::Falling), [0x11, 0, 2, 1, 0, 0]);
+    }
+
+    #[test]
+    fn driver_version_is_bcd() {
+        assert_eq!(
+            parse_driver_version(&[0x20, 0x16, 0x05, 0x31]).as_deref(),
+            Some("20160531")
+        );
+        assert_eq!(parse_driver_version(&[0xff, 0xff, 0xff, 0xff]), None);
+        assert_eq!(parse_driver_version(&[0x20]), None);
     }
 }

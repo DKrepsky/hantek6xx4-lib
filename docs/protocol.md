@@ -254,9 +254,9 @@ every bulk **read** size is **0x200 (512)** if byte0 != 0, else **0x40 (64)**. T
 | `0xA2` | `0x1600` | R/W | 2n | Calibration table (`dsoHTReadCalibrationData`/`Write…`) |
 | `0xA2` | `0x1B00` | R/W | 2n | Second calibration table (`dsoHTRDAmpCali`/`WRAmpCali`); validity flag `0xFACF` |
 | `0xA2` | `0x1D80` | R/W | 2n | Third table (DDS/AWG calibration, `dsoGetDDSCali`/`dsoSetDDSCali`) |
-| `0xEC` / `0xED` | `0x1700`, `0x1716` | R / W | 0x14, 1 | Unknown small areas (LAN/IP settings? `dsoUSBMode*`) |
-| `0xE3` | `0x15F0` | R | 4 | Unknown |
-| `0xF4` | `0x1F00` | R | 2 | Unknown (USB module version?) |
+| `0xEC` / `0xED` | `0x1700`, `0x1716` | W / R | 0x14, 1 | LAN settings (`dsoUSBModeSetIPAddr`/`GetIPAddr`, `dsoSetLANEnable`/`GetLANEnable`); `0xED` stalls on the 6254BC (10.12) |
+| `0xE3` | `0x15F0` | R | 4 | Driver/firmware version as 8 BCD digits (`dsoGetDriverVersion`); `20 16 05 31` on the 6254BC (10.12) |
+| `0xF4` | `0x1F00` | R | 2 | USB module version (`dsoGetUSBModulVersion`); stalls on the 6254BC (10.12) |
 | `0xF0` / `0xF1` | `0x1E00` | W / R | 0x40 | **Flash read/write** (`dsoWriteFlash`/`dsoReadFlash`, FPGA bitstream) — **never write** |
 
 Info string slices used by the DLL (offsets into the 71 bytes at `0xA2/0x1580`): device name `[6..14)`,
@@ -711,4 +711,25 @@ of the read address; the only deviations are one-sample flips about every 3000 s
 because the sample clock drifts slightly against the calibrator. The first ~11-16 frames after the start are stale RAM and
 are dropped (as in the normal capture). If the host does not read for longer than the RAM takes to fill, data is lost and
 the pointer alone cannot say so; the library estimates it from the elapsed time and returns an overrun error.
+
+### 10.12 The previously unknown control requests — read-only investigation
+
+Decoded from the vendor DLL and probed on the 6254BC with read-direction requests only (no `0xEC` writes were sent):
+
+| Request | wValue | Length | Vendor function | On the 6254BC |
+|---|---|---|---|---|
+| `0xE3` IN | `0x15F0` | 4 | `dsoGetDriverVersion`: each nibble is one digit, 8 digits | works: `20 16 05 31` = `20160531`, the same four bytes that sit at offset `0x10` of the `0xA2/0x15E0` area |
+| `0xED` IN | `0x1700` | 0x14 | `dsoUSBModeGetIPAddr`: IP, subnet mask, gateway (4 bytes each, byte-swapped), port u16, MAC (6 bytes) | stalls (Pipe error) |
+| `0xEC` OUT | `0x1700` | 0x14 | `dsoUSBModeSetIPAddr`: same layout | not sent (a write) |
+| `0xED` IN | `0x1716` | 1 | `dsoGetLANEnable` | stalls |
+| `0xEC` OUT | `0x1716` | 1 | `dsoSetLANEnable` | not sent (a write) |
+| `0xF4` IN | `0x1F00` | 2 | `dsoGetUSBModulVersion` | stalls |
+| `0xE5` IN | 0 | 10 | bus select (see 3) | stalls (as before) |
+
+So `0xEC`/`0xED`/`0xF4` belong to the LAN/USB-module option that some models have (`dsoOpenLan`, `dsoSetLANEnable`);
+this unit's firmware answers them with a stall, which is harmless: the control pipe recovers and the scope works
+normally afterwards. The library exposes only the driver version (`Scope::driver_version`, shown by `hantek6xx4 info`).
+The `0xA2/0x15E0` area (32 bytes before the calibration table) holds that version and otherwise `0xFF`, plus a few bytes
+whose purpose is unknown (`08 bf` at the start, `ea ea` at offset 6); the vendor code reads word 1 as the DDS calibration
+factor, which is `0xFFFF` (blank) here.
 
