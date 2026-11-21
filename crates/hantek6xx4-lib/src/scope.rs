@@ -265,8 +265,16 @@ impl<T: Transport> Scope<T> {
         let trigger_sample = state
             .triggered()
             .then(|| p::pre_trigger_samples(cfg.buffer_len, cfg.trigger.horizontal_position_percent) as usize);
+        let mut volts_per_div = [0.0; MAX_CHANNELS];
+        let mut zero_code = [0u8; MAX_CHANNELS];
+        for (i, c) in cfg.channels.iter().enumerate().take(MAX_CHANNELS) {
+            volts_per_div[i] = c.volts_per_div.volts();
+            zero_code[i] = 255 - c.position;
+        }
         Ok(Frame {
             samples,
+            volts_per_div,
+            zero_code,
             sample_interval_ns: p::sample_interval_ns(cfg.timebase, k),
             triggered: state.triggered(),
             trigger_sample,

@@ -598,3 +598,12 @@ Idx 0–3 are dominated by input noise (sd 20 counts at 2 mV).
 a DC offset to confirm.
 
 Remaining open: volts-per-count scale (needs a known voltage or `0xA2/0x1B00` decoding), AC coupling with a DC-offset signal, true 1 GS/s rate, pulse/video triggers, scan/roll, AWG, `0xEC/0xED/0xE3/0xF4`.
+
+### 10.7 Counts to volts
+
+Vendor convention (SDK demos, `MeasDll`): `volts = (code - zero) * 8 * V/div / 255`, with `zero = 255 - position`
+(code 127 for the default position 128). The 8 vertical divisions span the 8-bit range, so about 32 counts per
+division. `dsoHTSetAmpCalibrate` does not feed this formula: it writes hardware gain/offset words (command `0x1E`) from a
+built-in table. Checked on the 6254BC with the probe-compensation output on CH2: 1.51 V peak-to-peak at 500 mV, 1 V, 2 V
+and 5 V per division, low level at 0 V. The absolute calibrator voltage and per-unit gain error are not verified
+against an external reference; the `0xA2/0x1B00` amplitude table is not used by this conversion.

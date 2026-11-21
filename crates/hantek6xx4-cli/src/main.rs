@@ -113,6 +113,9 @@ struct CaptureArgs {
     timeout_ms: u64,
     #[arg(long, value_enum, default_value_t = Format::Summary)]
     format: Format,
+    /// Print volts instead of raw ADC codes (summary and csv formats)
+    #[arg(long)]
+    volts: bool,
     /// Write output to this file instead of stdout
     #[arg(short, long)]
     output: Option<String>,
@@ -283,7 +286,26 @@ fn capture(device: usize, a: CaptureArgs) -> Result<()> {
                 frame.triggered, frame.sample_interval_ns, frame.trigger_sample
             )?;
             for ch in Channel::ALL {
-                if let Some(s) = frame.channel(ch) {
+                if a.volts {
+                    if let Some(v) = frame.volts(ch) {
+                        let n = v.len() as f64;
+                        let mean = v.iter().sum::<f64>() / n;
+                        let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt();
+                        let min = v.iter().cloned().fold(f64::INFINITY, f64::min);
+                        let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        writeln!(
+                            out,
+                            "CH{}: {} samples  min {:.3} V  max {:.3} V  pp {:.3} V  mean {:.3} V  sd {:.3} V",
+                            ch.index() + 1,
+                            v.len(),
+                            min,
+                            max,
+                            max - min,
+                            mean,
+                            sd
+                        )?;
+                    }
+                } else if let Some(s) = frame.channel(ch) {
                     let n = s.len() as f64;
                     let mean = s.iter().map(|&x| x as f64).sum::<f64>() / n;
                     let sd = (s.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
@@ -306,13 +328,24 @@ fn capture(device: usize, a: CaptureArgs) -> Result<()> {
                 .filter(|&c| frame.channel(c).is_some())
                 .collect();
             let header: Vec<String> = std::iter::once("time_ns".to_string())
-                .chain(chans.iter().map(|c| format!("ch{}", c.index() + 1)))
+                .chain(
+                    chans
+                        .iter()
+                        .map(|c| format!("ch{}{}", c.index() + 1, if a.volts { "_v" } else { "" })),
+                )
                 .collect();
             writeln!(out, "{}", header.join(","))?;
             let len = frame.channel(chans[0]).map(|s| s.len()).unwrap_or(0);
             for i in 0..len {
                 let row: Vec<String> = std::iter::once(format!("{}", i as f64 * frame.sample_interval_ns))
-                    .chain(chans.iter().map(|&c| frame.channel(c).unwrap()[i].to_string()))
+                    .chain(chans.iter().map(|&c| {
+                        let code = frame.channel(c).unwrap()[i];
+                        if a.volts {
+                            format!("{:.4}", frame.code_to_volts(c, code))
+                        } else {
+                            code.to_string()
+                        }
+                    }))
                     .collect();
                 writeln!(out, "{}", row.join(","))?;
             }
