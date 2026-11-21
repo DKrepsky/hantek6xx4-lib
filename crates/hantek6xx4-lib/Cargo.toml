@@ -1,13 +1,20 @@
 [package]
 name = "hantek6xx4-lib"
-description = "Driver library for Hantek 6xx4-series USB oscilloscopes (first target: 6254BC)"
+description = "Driver library for Hantek 6xx4-series USB oscilloscopes (6254BC), reverse engineered, with a mock transport for tests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
-readme = "../../README.md"
-keywords = ["oscilloscope", "hantek", "usb", "driver"]
-categories = ["hardware-support"]
+repository.workspace = true
+authors.workspace = true
+rust-version = "1.74"
+readme = "README.md"
+keywords = ["oscilloscope", "hantek", "usb", "driver", "instrument"]
+categories = ["hardware-support", "embedded"]
+
+[features]
+default = []
+# Build libusb from source instead of using the system library (simplest on Windows and macOS).
+vendored = ["rusb/vendored"]
 
 [dependencies]
 rusb = "0.9"

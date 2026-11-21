@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/hantek6xx4-lib", "crates/hantek6xx4-cli"]
+exclude = ["docs/research/config_probe", "docs/research/replay_probe"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/DKrepsky/hantek6xx4-lib"
-rust-version = "1.74"
+authors = ["hantek6xx4-lib contributors"]

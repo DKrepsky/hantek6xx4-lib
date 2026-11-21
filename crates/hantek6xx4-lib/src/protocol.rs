@@ -88,6 +88,7 @@ pub fn cmd_start(sweep: Sweep) -> [u8; 4] {
 pub struct State(pub u16);
 
 impl State {
+    /// Parse the first two bytes of a state reply.
     pub fn parse(reply: &[u8]) -> Result<Self> {
         if reply.len() < 2 {
             return Err(Error::Protocol("state reply shorter than 2 bytes".into()));
@@ -114,6 +115,7 @@ pub struct BufferStatus {
 }
 
 impl BufferStatus {
+    /// Parse the first four bytes of a buffer status reply.
     pub fn parse(reply: &[u8]) -> Result<Self> {
         if reply.len() < 4 {
             return Err(Error::Protocol("buffer status reply shorter than 4 bytes".into()));

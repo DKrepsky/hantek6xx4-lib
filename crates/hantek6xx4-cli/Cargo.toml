@@ -1,17 +1,27 @@
 [package]
 name = "hantek6xx4-cli"
-description = "Command line tool to talk to Hantek 6xx4-series USB oscilloscopes"
+description = "Command line tool for Hantek 6xx4-series USB oscilloscopes: capture, roll streaming, calibration backup"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version = "1.85"
+readme = "README.md"
+keywords = ["oscilloscope", "hantek", "usb", "cli", "instrument"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [[bin]]
 name = "hantek6xx4"
 path = "src/main.rs"
 
+[features]
+default = []
+# Build libusb from source instead of using the system library.
+vendored = ["hantek6xx4-lib/vendored"]
+
 [dependencies]
-hantek6xx4-lib = { path = "../hantek6xx4-lib" }
+hantek6xx4-lib = { path = "../hantek6xx4-lib", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 env_logger = "0.11"

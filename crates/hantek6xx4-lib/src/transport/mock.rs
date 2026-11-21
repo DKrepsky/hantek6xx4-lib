@@ -7,10 +7,31 @@ use std::collections::VecDeque;
 /// One recorded operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
-    ControlIn { request: u8, value: u16, len: usize },
-    ControlOut { request: u8, value: u16, data: Vec<u8> },
+    /// A vendor control read.
+    ControlIn {
+        /// `bRequest`.
+        request: u8,
+        /// `wValue`.
+        value: u16,
+        /// Requested length in bytes.
+        len: usize,
+    },
+    /// A vendor control write.
+    ControlOut {
+        /// `bRequest`.
+        request: u8,
+        /// `wValue`.
+        value: u16,
+        /// The bytes sent.
+        data: Vec<u8>,
+    },
+    /// A bulk write (the bytes sent).
     BulkOut(Vec<u8>),
-    BulkIn { len: usize },
+    /// A bulk read.
+    BulkIn {
+        /// Requested length in bytes.
+        len: usize,
+    },
 }
 
 type ControlInHandler = Box<dyn FnMut(u8, u16, usize) -> Vec<u8> + Send>;

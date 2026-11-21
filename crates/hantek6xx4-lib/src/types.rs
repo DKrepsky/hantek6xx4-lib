@@ -9,9 +9,13 @@ pub const MAX_CHANNELS: usize = 4;
 /// An analog input channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
+    /// Channel 1.
     Ch1,
+    /// Channel 2.
     Ch2,
+    /// Channel 3.
     Ch3,
+    /// Channel 4.
     Ch4,
 }
 
@@ -43,7 +47,9 @@ const VDIV_LABELS: [&str; 12] = [
 const VDIV_VOLTS: [f64; 12] = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
 
 impl VoltsPerDiv {
+    /// Number of vertical ranges.
     pub const COUNT: u8 = 12;
+    /// 1 V per division.
     pub const V1: VoltsPerDiv = VoltsPerDiv(8);
 
     /// From the device index (0 = 2 mV ... 11 = 10 V).
@@ -86,6 +92,7 @@ impl FromStr for VoltsPerDiv {
 pub struct TimeBase(u8);
 
 impl TimeBase {
+    /// Number of time bases.
     pub const COUNT: u8 = 36;
 
     /// From the device index (0 = 2 ns/div ... 35 = 1000 s/div).
@@ -143,14 +150,18 @@ impl FromStr for TimeBase {
 /// Input coupling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Coupling {
+    /// DC coupled (the input level is passed through).
     Dc,
+    /// AC coupled (the DC component is blocked).
     Ac,
 }
 
 /// Trigger edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slope {
+    /// Low to high.
     Rising,
+    /// High to low.
     Falling,
 }
 
@@ -166,9 +177,13 @@ pub enum Sweep {
 /// Per-channel vertical settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChannelConfig {
+    /// Whether the channel is acquired.
     pub enabled: bool,
+    /// Vertical sensitivity.
     pub volts_per_div: VoltsPerDiv,
+    /// Input coupling.
     pub coupling: Coupling,
+    /// Enable the hardware bandwidth limit (about 20 MHz).
     pub bandwidth_limit: bool,
     /// Vertical position, 0..=255. Zero volts is at ADC code 128 for the default 128 (see [`zero_code_for_position`]).
     pub position: u8,
@@ -191,6 +206,7 @@ impl Default for ChannelConfig {
 pub enum PulseCondition {
     /// Width equal to the setting (the hardware accepts +-5 %).
     Equal,
+    /// Width different from the setting.
     NotEqual,
     /// Wider than the setting.
     Greater,
@@ -210,11 +226,15 @@ pub enum VideoStandard {
 /// What the video trigger synchronises to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoSync {
+    /// Every line.
     AllLines,
     /// One line number (1-based).
     Line(u16),
+    /// Odd fields.
     OddField,
+    /// Even fields.
     EvenField,
+    /// Every field.
     AllFields,
 }
 
@@ -230,11 +250,14 @@ pub enum TriggerKind {
     Pulse {
         /// Pulse width in nanoseconds, 10 ns to 10 s.
         width_ns: u64,
+        /// How the measured width is compared with `width_ns`.
         condition: PulseCondition,
     },
     /// Video trigger.
     Video {
+        /// Television standard (sets the line numbering).
         standard: VideoStandard,
+        /// What to synchronise to.
         sync: VideoSync,
         /// True for positive sync polarity.
         positive: bool,
@@ -246,8 +269,11 @@ pub enum TriggerKind {
 pub struct TriggerConfig {
     /// Channel to trigger on (must be enabled).
     pub source: Channel,
+    /// Edge, pulse or video trigger.
     pub kind: TriggerKind,
+    /// Edge slope; for the pulse trigger rising selects positive and falling negative pulses.
     pub slope: Slope,
+    /// Behaviour when no trigger arrives.
     pub sweep: Sweep,
     /// Trigger threshold as an ADC code (0..=228); it is compared with the raw sample values.
     pub level: u8,
@@ -271,8 +297,11 @@ impl Default for TriggerConfig {
 /// Complete acquisition setup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Per-channel settings, CH1 first.
     pub channels: [ChannelConfig; MAX_CHANNELS],
+    /// Horizontal time base (shared by all channels).
     pub timebase: TimeBase,
+    /// Trigger settings.
     pub trigger: TriggerConfig,
     /// Samples per channel in a frame. Only 4096 is verified on hardware.
     pub buffer_len: u32,

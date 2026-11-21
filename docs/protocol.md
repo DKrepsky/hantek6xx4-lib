@@ -1,735 +1,703 @@
-# Hantek 6254BC — Protocol Research
+# Hantek 6xx4 USB Protocol Specification
 
-Status: **research notes, unverified against hardware.** Compiled 2026-11-20 from public sources
-(forum posts, GitHub repos, sigrok wiki). Byte values were extracted from those sources and have
-**not** been tested on a real 6254BC. Almost all public material targets the 6254**BD**; forum
-posters say the 6xx4BC and 6xx4BD share the same PCB and protocol (differences are believed to be
-in EEPROM/FPGA firmware), but this is opinion until confirmed on our unit.
+This document specifies the USB protocol of the Hantek 6xx4-series oscilloscopes as implemented by
+[`hantek6xx4-lib`](../README.md). It was obtained by reverse engineering, since the vendor does not publish it
+(see [research notes](research/README.md) for how). Every statement carries one of three evidence levels:
 
-## 1. Summary
-
-- No complete public protocol spec or finished open-source driver exists for the 6254BC.
-- Two partial reverse-engineering efforts exist for the 6xx4 family (libhantek6xx4, pyhantek) and
-  agree on the transport and most of the command set.
-- A driver is feasible, but we must verify and finish the protocol ourselves (USB traces of the
-  official software).
-
-## 1a. Verified on our 6254BC unit (2026-11-20)
-
-Read-only probe (Rust + rusb, only control reads, no writes):
-
-- `lsusb`: `04b5:6cde` "ROHM LSI Systems USA / DSO Device", bcdUSB 2.00 (high speed), bcdDevice 0.00,
-  iSerial 0. Interface 0 vendor class, EP `0x02` OUT bulk 512, EP `0x86` IN bulk 512.
-  **Confirms the USB ID and endpoints for the BC.** Device is already running firmware (no loader).
-- Control `0xB2` (IN, 10-byte buffer): returned **1 byte**, `01` = ready.
-- Control `0xA2` wValue `0x1580` (IN, 71 bytes), `0xFF` bytes are separators/padding:
-  ```
-  44 53 4f ff ff ff 36 30 30 30 ff ff ff ff 50 31   DSO...6000....P1
-  2e 30 36 ff 44 31 2e 30 30 ff 4d 30 30 37 43 30   .06.D1.00.M007C0
-  31 31 36 34 43 30 32 31 35 33 32 30 31 37 30 32   1164C02153201702
-  32 32 32 30 31 37 30 32 32 32 54 30 33 33 46 32   2220170222T033F2
-  c0 30 31 ff 03 ff ff                              .01....
-  ```
-  Fields: `DSO`, `6000` (family), `P1.06` (PCB revision 1.06), `D1.00`, then an `M…` blob
-  (`M007C01164C0215320170222201702 22…T033F2…01`) that likely holds serial/date/model codes.
-  The string does **not** name "6254BC"; model identification needs the decompiled software or
-  EEPROM comparison. Note libhantek6xx4's offsets (PCB rev at `[14..18]`) match `P1.06`; its
-  serial offset `[20..27]` lands on `D1.00\xffM0`, so that offset is probably wrong.
-- Control `0xA2` wValue `0x15E0` (IN, 8 bytes): `08 bf ff ff ff ff ea ea`.
-- Control `0xA2` wValue `0x1600` (IN, 1154 bytes = 577 u16): **valid**, last u16 = `0xFBCF`.
-  Mostly default values `0x0004` / `0x0005`, with non-default groups of 8 u16 at the start of
-  some blocks (per-channel/per-range calibration), layout still to be decoded.
-- Not yet tried: any bulk command (`09 00`, `0C 00`, status, capture).
-
-## 2. Hardware (6254BD teardown, assumed same for BC)
-
-| Part | Chip / detail |
+| Label | Meaning |
 |---|---|
-| USB controller | Cypress CY7C68013A (FX2LP, 8051). Firmware loaded from EEPROM at power-up |
-| EEPROM | Microchip 24LC64 (64 Kbit I2C), holds FX2 firmware |
-| FPGA | Xilinx Spartan-6 XC6SLX16 |
-| FPGA config flash | Macronix MX25L4006E (4 Mbit SPI), wired to FX2 port D pins (PD0–PD4) |
-| ADC | Analog Devices HMCAD1511, 8-bit, 1 GS/s, 4 channels |
-| PLL / clock | Analog Devices ADF4360-7 |
-| Front end control | 74HC595 shift registers (one per channel): attenuator relays, AC/DC relay, bandwidth limit, ADC driver enable |
-| AWG DAC | TI DAC902E (12-bit), reported for the 6254BD in third-party teardowns; **the 6254BC unit used here has no generator output** (see 8.11) |
-| Capture memory | 64K |
-| Other | 24 MHz crystal, TLV274C op-amps, TPS63000 buck-boost (U38) |
+| **Verified** | Exercised on a real device and the result checked (against a known signal, a multimeter or the data itself) |
+| **Vendor** | Taken from the decompiled vendor library; accepted by the device but its effect was not independently checked |
+| **Unverified** | Third-party claim or inference; not used by the library |
 
-Spec (6254BD): 4 channels, 250 MHz, 1 GSa/s, 8-bit, 1 MΩ‖25 pF, edge/pulse/video/alternate triggers.
+**Reference unit.** All verification was done on one Hantek 6254BC: USB ID `04b5:6cde`, family string `6000`,
+PCB `P1.06`, FPGA version `0xD001`, driver version `20160531`. Other units and models of the family (for example the
+6254BD) are expected to behave the same way but are untested; values that are calibrations of one unit are marked as such.
 
-Forum claims (unverified): there is no hardware difference between 6xx4 models, bandwidth is
-limited in software/EEPROM/FPGA config; BC and BD PCBs look the same with small component
-population differences.
+**Conventions.** Multi-byte fields are little-endian unless stated. Command bytes are hexadecimal. A *frame* is one
+sample instant of all enabled channels. An *ADC code* is the raw 8-bit sample value.
 
-## 3. USB transport
+## Contents
 
-- **USB ID:** `04b5:6cde` ("ROHM LSI Systems USA" in lsusb; iManufacturer "ODM", iProduct "DSO Device").
-  Seen on 6254BD and 6204BD. A Hantek support post says the Windows INF uses the same ID while the
-  scope reports `04b4:8613` in software. **The 6254BC ID is unconfirmed.**
-- Class 0xFF (vendor specific), 1 configuration, 1 interface, bus powered (500 mA).
-- **No firmware upload at connect:** a Windows capture showed only standard enumeration plus
-  control/bulk traffic, so the FX2 already runs its EEPROM firmware. (Unlike the 6022, which needs
-  firmware uploaded by the host.)
-- **Endpoints:** bulk OUT `0x02` (commands), bulk IN `0x86` (responses and samples), wMaxPacketSize 512.
-  If the device is not in high-speed mode, packets are 64 bytes.
+1. [Hardware](#1-hardware)
+2. [USB transport](#2-usb-transport)
+3. [Device memory areas](#3-device-memory-areas)
+4. [Bulk command reference](#4-bulk-command-reference)
+5. [Initialisation](#5-initialisation)
+6. [Acquisition](#6-acquisition)
+7. [Configuration](#7-configuration)
+8. [Triggers](#8-triggers)
+9. [Converting samples to volts](#9-converting-samples-to-volts)
+10. [Verification status and limitations](#10-verification-status-and-limitations)
+- [Appendix A: Measurement data](#appendix-a-measurement-data)
+- [Appendix B: Vendor API map](#appendix-b-vendor-api-map)
 
-### 3.1 Vendor control requests (wIndex = 0)
+## 1. Hardware
 
-| bRequest | Dir | Purpose |
+Component list from third-party teardowns of the 6254BD, which has the same board family. Items marked † were not
+confirmed on the BC unit.
+
+| Function | Part |
+|---|---|
+| USB controller | Cypress CY7C68013A (FX2LP, 8051); runs its firmware from an I2C EEPROM at power-up |
+| Firmware EEPROM † | Microchip 24LC64 (64 Kbit) |
+| FPGA | Xilinx Spartan-6 XC6SLX16; configuration flash Macronix MX25L4006E (4 Mbit SPI) † |
+| ADC | Analog Devices HMCAD1511, 8-bit, up to 1 GS/s, 4 channels |
+| Clock synthesizer | Analog Devices ADF4360-7 |
+| Front-end control | 74HC595 shift registers (one per channel): attenuator relays, AC/DC relay, bandwidth limit |
+| Capture memory | 64 KiB circular RAM behind the FPGA |
+| Signal generator † | TI DAC902E on the 6254BD. **The 6254BC used here has no generator output** and its generator calibration areas are blank |
+
+Specification of the 6254BD: 4 channels, 250 MHz, 1 GS/s, 8-bit, 1 MΩ ‖ 25 pF input, edge, pulse, video and alternate
+triggers. Third-party reports say the BC and BD share the PCB and differ in EEPROM/FPGA firmware.
+
+## 2. USB transport
+
+### 2.1 Device
+
+**Verified.** USB ID `04b5:6cde` (reported as "ROHM LSI Systems USA" / "DSO Device"), USB 2.0 high speed, one
+configuration, one vendor-specific interface (class `0xFF`), bus powered. The device is running its firmware when it
+enumerates; no firmware upload is needed (unlike the Hantek 6022).
+
+| Endpoint | Direction | Type | Max packet |
+|---|---|---|---|
+| `0x02` | OUT | bulk | 512 bytes (64 if not high speed) |
+| `0x86` | IN | bulk | 512 bytes (64 if not high speed) |
+
+### 2.2 Vendor control requests
+
+All use `bmRequestType` vendor, `wIndex = 0`.
+
+| bRequest | Dir | wValue | Length | Purpose | Status |
+|---|---|---|---|---|---|
+| `0xB3` | OUT | 0 | 10 | Transfer-mode preamble, sent before every bulk write (2.3) | Verified |
+| `0xB2` | IN | 0 | 10 | Ready flag; byte 0 non-zero = high speed (512-byte packets). The device returns one byte, `01` | Verified |
+| `0xA2` | IN | area (section 3) | n | Read a device memory area. The write direction exists and must not be used | Verified (read) |
+| `0xE3` | IN | `0x15F0` | 4 | Driver version, 8 BCD digits (`20 16 05 31` = `20160531`) | Verified |
+| `0xEA`, `0xE5` | OUT | 0 | 10 | Select the USB or SPI bus path in the vendor driver. `0xEA` as OUT and `0xE5` as a read both **stall** on the 6254BC; not needed | Verified (stalls) |
+| `0xEC` / `0xED` | OUT / IN | `0x1700`, `0x1716` | 20, 1 | LAN settings (IP, mask, gateway, port, MAC) and LAN enable flag, for models with a LAN option. `0xED` **stalls** on the 6254BC; `0xEC` (a write) was never sent | Vendor |
+| `0xF4` | IN | `0x1F00` | 2 | USB module version. **Stalls** on the 6254BC | Vendor |
+| `0xF0` / `0xF1` | OUT / IN | `0x1E00` | 64 | FPGA bitstream flash write/read. **Never write**; not implemented | Vendor |
+
+A stall (`LIBUSB_ERROR_PIPE`) is the device refusing an unsupported request. The control pipe recovers and the scope works
+normally afterwards. Control reads longer than 1024 bytes work as a single transfer on the 6254BC (the 1154-byte
+calibration read); the vendor driver splits them into 1024-byte chunks.
+
+### 2.3 Bulk commands
+
+**Verified.** Commands are sent on endpoint `0x02`. **Before every bulk write**, the host sends control OUT `0xB3` with
+the 10-byte payload `0f 03 03 03 00 00 00 00 00 00` followed by control IN `0xB2`. The vendor library defines other
+payloads for other transfer modes (`0f 0a 0a 0a`, `0f 09 09 09`, `0f 01 01 01`, `0f 02 02 02`, `0f 08 08 08`); only
+`0f 03 03 03` is used for commands.
+
+Replies arrive on endpoint `0x86` as full packets (512 bytes in high speed). A reply carries its value in the first bytes
+and is padded; the host always reads a whole packet. Bulk reads of sample data are multiples of 512 bytes.
+
+### 2.4 Write safety
+
+The EEPROM (FX2 firmware) and the FPGA flash can be corrupted by wrong writes; a bad write can leave the scope unusable
+(third-party reports describe bricked units). The library only reads these areas. Back up the factory tables with
+`hantek6xx4 dump-calibration` and `dump-amp-calibration` before experimenting.
+
+## 3. Device memory areas
+
+Read with control IN `0xA2`, `wValue` = area address.
+
+| wValue | Length | Content | Status |
+|---|---|---|---|
+| `0x1580` | 71 | Info string (3.1) | Verified |
+| `0x15E0` | 32 | User/driver area: driver version at offset 16, otherwise mostly `0xFF` (3.2) | Verified |
+| `0x1600` | 1154 | Position calibration table, 577 words (3.3) | Verified |
+| `0x1B00` | 578 | Amplitude (gain trim) table, 289 words (3.4) | Verified |
+| `0x1D80` | up to 640 | DDS calibration; blank (`0xFF`) on the 6254BC | Verified (blank) |
+
+### 3.1 Info string
+
+71 bytes; `0xFF` is padding. On the reference unit:
+
+```
+44 53 4f ff ff ff 36 30 30 30 ff ff ff ff 50 31   DSO...6000....P1
+2e 30 36 ff 44 31 2e 30 30 ff 4d 30 30 37 43 30   .06.D1.00.M007C0
+31 31 36 34 43 30 32 31 35 33 32 30 31 37 30 32   1164C02153201702
+32 32 32 30 31 37 30 32 32 32 54 30 33 33 46 32   2220170222T033F2
+c0 30 31 ff 03 ff ff                              .01....
+```
+
+| Bytes | Field | Reference unit | Status |
+|---|---|---|---|
+| `[6..14)` | device family | `6000` | Verified |
+| `[14..20)` | PCB revision | `P1.06` | Verified |
+| `[34..42)` | serial-like field | `64C02153` | Vendor |
+
+The string does not contain the model name. The PCB revision digits are parsed into a number (`1.06` becomes 106) that
+selects the ADC gain register value (7.2). The remaining fields (`D1.00`, the `M…` block) are unidentified.
+
+### 3.2 User / driver area (`0x15E0`)
+
+32 bytes: `08 bf ff ff ff ff ea ea ff ff ff ff ff ff ff ff 20 16 05 31 ff ff …`. The four bytes at offset 16 are the driver
+version (BCD digits `20160531`), also readable with request `0xE3`. The meaning of `08 bf` and `ea ea` is unknown. The
+vendor code reads word 1 as a generator calibration factor; it is `0xFFFF` (blank) here, so the vendor library would use
+its default.
+
+### 3.3 Position calibration table (`0x1600`)
+
+**Verified.** 577 words: 576 calibration words followed by the validity flag `0xFBCF`. The 576 words are 4 channels ×
+12 rows × 12 entries, used to compute the vertical position word (7.6). If the flag is wrong the vendor library
+substitutes defaults.
+
+### 3.4 Amplitude table (`0x1B00`)
+
+**Verified.** 289 words: 288 words (4 channels × 12 rows × 6 slots) followed by the flag `0xFACF`. A wrong flag means no
+correction. Each value is a gain factor in units of 1/1024 (`0x400` = 1.0). The table is per unit factory data.
+
+- **Row** = vertical range index remapped: 5 for indexes 0 to 5, 7 for 6 to 8, 9 for 9 to 11. Only rows 5, 7 and 9
+  (and a few words of row 8) carry data on the reference unit.
+- **Slot** 0, 1, 2 = ADC channel mode 1, 2, 4 (7.2). Slots 3 to 5 stay `0x400`.
+- Index of a trim: `(channel × 12 + row) × 6 + slot`.
+
+On the reference unit the trims are within a few percent and differ per channel; for the one-channel mode on row 7 they
+are CH1 `0x455`, CH2 `0x440`, CH3 `0x445`, CH4 `0x454`. They are close to 1.0 in the four-channel mode. The effect of
+the trims is described in 7.7.
+
+## 4. Bulk command reference
+
+All commands are sent on endpoint `0x02` (with the preamble of 2.3). The first byte is the command id, the second is
+always `00`.
+
+| Cmd | Bytes | Meaning | Reply | Status |
+|---|---|---|---|---|
+| `0C` | `0C 00` | Reset | First u16 = FPGA version (`0xD001`); the reply packet repeats `01 d0` | Verified |
+| `09` | `09 00` | Hardware version | First u32; all zero on the reference unit | Verified |
+| `06` | `06 00` | State word | First u16 (6.1) | Verified |
+| `03` | `03 00 m 00` | Start acquisition; bit 0 auto, bit 1 roll, bit 2 stop (6.1) | none | Verified |
+| `0D` | `0D 00` | Buffer status (6.2) | u16 trigger address, u16 end address, … | Verified |
+| `0E` | `0E 00 lo hi` | Set the byte address where the next readback starts | none | Verified |
+| `05` | `05 00 lo hi` | Read back `2 × value` bytes of capture RAM | data packets | Verified |
+| `08` | `08 00 00 d0 d1 reg cs 00` | SPI write of the 16-bit word `d1:d0` to register `reg` of chip `cs` (1 relay shift registers, 2 ADF4360-7, 4 HMCAD1511) | none | Verified |
+| `0F` | `0F 00 <u32>` | Time base divisor minus one (7.3) | none | Verified |
+| `10` | `10 00 <6 bytes> <6 bytes>` | Horizontal trigger position (7.4) | none | Verified |
+| `00`, `01`, `02`, `04` | `id 00 lo hi` | Vertical position word of CH1, CH2, CH3, CH4 (7.6) | none | Verified |
+| `1E` | `1E 00 …` (26 bytes) | Gain trim (7.7) | none | Verified |
+| `07` | `07 00 …` (26 bytes) | Trigger level (8.2) | none | Verified |
+| `11` | `11 00 mode slope coupling 00` | Trigger mode (8.3) | none | Verified |
+| `12` | `12 00 b2 00 b4 b5` | Trigger source routing (8.1) | none | Verified |
+| `13` | `13 00 …` (16 bytes) | Pulse trigger (8.4) | none | Verified |
+| `16` | `16 00 …` (16 bytes) | Video trigger (8.5) | none | Vendor |
+| `18` | `18 00` | Initialise SDRAM | none | Vendor (not used) |
+
+The channel position id is `00` for CH1 and `1 << (ch − 1)` for CH2 to CH4 (`01`, `02`, `04`). Writes to the position
+registers are followed by a 10 ms pause.
+
+## 5. Initialisation
+
+**Verified.** Order used by the library (the same as the vendor library's `dsoInitHard`, minus the `0xEA` bus select that
+the 6254BC stalls on):
+
+1. Bulk `0C 00` (reset); read the reply, first u16 = FPGA version.
+2. Control IN `0xA2`/`0x1580` for the info string.
+3. Control IN `0xA2`/`0x1600` (position calibration; the flag `0xFBCF` must be present) and `0xA2`/`0x1B00`
+   (amplitude table; without the flag no trim is applied).
+4. ADC and clock synthesizer bring-up by SPI writes (`08 00 00 d0 d1 reg cs 00`), each followed by a pause:
+
+| Chip | Register | Value | Pause after |
+|---|---|---|---|
+| HMCAD1511 (`cs 4`) | `0x12` | `0x4777` | 2 ms |
+| HMCAD1511 | `0x33` | `0x0003` | 2 ms |
+| ADF4360-7 (`cs 2`) | `0x30` | `0x0065` | 2 ms |
+| ADF4360-7 | `0x0F` | `0xF128` | 2 ms |
+| ADF4360-7 | `0x01` | `0x3812` | 15 ms |
+
+The device answers the state and version commands as soon as the reset has been sent. The state word is `0x0000` before
+this sequence and `0x8402` after it.
+
+## 6. Acquisition
+
+### 6.1 Start, state, stop
+
+**Verified.** `03 00 m 00` starts an acquisition: `m = 1` auto (free running), `m = 0` normal (wait for a trigger),
+`m = 4` stop. In the vendor library bit 0 is auto, bit 1 roll and bit 2 stop after this collection; the roll bit makes no
+observable difference on the 6254BC.
+
+The state word (first u16 of the reply to `06 00`):
+
+| Value | Meaning |
+|---|---|
+| `0x0000` | before initialisation |
+| `0x8402` | initialised, idle |
+| `0xC100` | acquisition started, capture in progress (also the permanent value during roll streaming) |
+| `0xC200` | armed, waiting for a trigger |
+| `0xC402` | data ready, no trigger (auto sweep or forced) |
+| `0xC403` | data ready and triggered |
+
+Bit 0 is *triggered* and bit 1 is *data ready*. The vendor library also names bit 3 (pack state) and bit 4 (SDRAM
+initialised); they were not exercised. In normal sweep with no trigger, bit 1 never gets set.
+
+A capture takes the time of the pre-trigger fill plus the post-trigger part of the window, so the host polls the state
+until bit 1 is set (a 20 ms pause between polls is plenty) and stops with `03 00 04 00` on timeout.
+
+### 6.2 Buffer status and trigger-aligned readback
+
+**Verified.** `0D 00` returns, among other fields: `u16 @ 0` = byte address of the trigger edge in the 64 KiB capture RAM
+(only valid after a triggered capture, within about 20 bytes of the edge), `u16 @ 2` = end address (the write pointer),
+byte `@ 4` (`06` or `07`), `u16 @ 6` = `0x5555`, `u16 @ 8` = copy of `u16 @ 0`.
+
+Reading a window of `B` samples per channel after the state shows *data ready*:
+
+1. `0D 00`; `end = u16 @ 2`.
+2. Triggered: `start = (end − B × stride) mod 0x10000`, rounded down to a multiple of 8, where `stride` is the bytes per
+   frame (6.3). Not triggered (auto sweep): `start = 0`.
+3. `0E 00 start_lo start_hi`.
+4. `05 00 w_lo w_hi` with `w = B × stride / 2`.
+5. Read `B × stride` bytes in 512-byte packets.
+
+The window then contains the trigger edge at the configured horizontal position (7.4), to within a few samples (section
+10). The documented depth is `B = 4096` samples per channel; the RAM holds 64 KiB.
+
+### 6.3 Sample data layout
+
+**Verified.** Samples are unsigned 8-bit, one byte per enabled channel per frame:
+
+| Enabled channels `n` | Stride (bytes per frame) | Order within a frame |
 |---|---|---|
-| `0xB3` (179) | OUT | Initialize/reset. Sent before each bulk command with 10-byte preamble `0f 03 03 03 00 00 00 00 00 00` |
-| `0xB2` (178) | IN, 10 B | Check ready. Byte 0 == 1 means ready (also selects 512 vs 64 byte packets) |
-| `0xA2` (162) | IN | Device info. wValue `0x1580`, len 0x47: ID string (PCB revision at id[14..18], serial at id[20..27]). wValue `0x1600`: calibration data, 12*12*4+1 = 577 uint16, last entry `0xFBCF` = valid flag. wValue `0x15E0`, len 8: second info read (pyhantek, "driver version?") |
-| `0xF1` (241) | — | Bitstream flash access, wValue `0x1E00` (defined in libhantek6xx4 `hantek_flash.c`, not reviewed) |
-| `0xEA` (234) | OUT | 10 zero bytes, early setup step in pyhantek (purpose unknown) |
+| 1 | 1 | the channel |
+| 2 | 2 | enabled channels in ascending order |
+| 3 or 4 | 4 | CH1, CH2, CH3, CH4 (the unused channel of a 3-channel capture holds a constant) |
 
-### 3.2 Bulk OUT command set (endpoint 0x02)
+The stride follows the number of enabled channels, not the ADC channel mode of 7.2. The 64 KiB RAM holds data from older
+captures; only the first `B × stride` bytes of a fresh acquisition are valid. The first 16 frames of an auto-sweep
+capture read from address 0 may be stale and the library drops them. A 1 kHz square wave has the same period in samples
+in 1-, 2- and 4-channel modes at the same time base.
 
-Consistent between libhantek6xx4 and pyhantek. First byte is the command ID.
+### 6.4 Continuous streaming (scan and roll)
 
-| Cmd | Bytes | Purpose |
-|---|---|---|
-| `0x0C` | `0C 00` | Reset |
-| `0x09` | `09 00`, then 4-byte read | Hardware (FPGA) version |
-| `0x08` | `08 00 00 lo hi reg cs 00` | SPI write. `cs`: `0x1` front-end shift reg, `0x2` ADF4360, `0x4` HMCAD1511 |
-| `0x0F` | `0F 00 <u32 LE>` | Timebase / sample-rate divider. pyhantek: `raw = (250e6 / rate)/2 - 1` (max 250 MHz via this path); libhantek6xx4 sends `table value - 1` |
-| `0x00,0x01,0x02,0x04` | `id 00 lo hi` | Channel vertical position for CH1..CH4 (note CH4 = `0x04`), derived from calibration data |
-| `0x07` | `07 00` + 24 bytes | Trigger level: 4 groups of (high,high,low,low) + 8 copies of the level. Level capped at `0xE4` |
-| `0x11` | `11 00 mode slope coupling 00` | Trigger config. mode: edge 0, pulse 1, video 2, force 0x80. slope: rise 0, fall 1. coupling: DC 0, AC 1 |
-| `0x12` | `12 00 b2 00 00 b5` | Trigger source. libhantek6xx4: `b2 = ((peak&1)<<6)\|(chanmask<<2)\|mask`, `b5 = (!enabled<<2)\|ch`. Marked FIXME (valid only at ≤250 MSa/s) |
-| `0x10` | 14 bytes | Horizontal trigger position. **Hard-coded in both projects** (`0x831C4`, `0x7D7D0` / `214828`, `205600`) |
-| `0x13` | — | Special trigger (pulse/video). Defined, not implemented anywhere |
-| `0x03` | `03 00 mode 00` | Start capture. mode: auto 0, roll 1, single 2 (pyhantek uses `03 00 01 00`) |
-| `0x06` | `06 00`, then 1-byte read | Status: bit0 triggered, bit1 data ready, bit3 pack state, bit4 SDRAM init |
-| `0x0D` | `0D 00`, then 5-byte read | Buffer status (40-bit word; pyhantek: `trig23 = d[2]+d[3]*256`, `trig45 = d[4]`) |
-| `0x0E` | `0E 00 lo hi` | Buffer prepare transfer. Defined; pyhantek sends it with 0 |
-| `0x05` | `05 00 lo hi` | Read back buffer. Length field = buffer bytes / 2 per libhantek6xx4; pyhantek sends `05 00 00 80` (128 packets × 512 = 64 KiB) |
-| `0x1E` | `1E 00 00 04 00 04 00 04 00 04 00` + 16 zero bytes | Channel offsets (pyhantek, `config_channel_offset`) |
+**Verified.** In the vendor software, scan (time base index 25 and slower) and roll (index 27 and slower) are display
+modes; the hardware behaviour is the same. After `03 00 m 00` the FPGA keeps writing frames into the 64 KiB RAM, wrapping
+at `0x10000`, and the host reads what is new:
 
-### 3.3 Front-end shift register (SPI cs=0x1)
+1. `0D 00`; `end = u16 @ 2` is the write pointer.
+2. New bytes = `(end − last) mod 0x10000`, rounded down to whole frames (and to an even length).
+3. `0E 00 last_lo last_hi`, `05 00 w_lo w_hi` with `w = bytes / 2`, then read the bytes. Reading across the wrap works.
+4. Remember `end` as `last`.
 
-Message: `08 00 00 ch0 ch1 ch2 ch3 latch`, sent with latch = 0 then 1. Per-channel byte bits:
+The pointer advances in steps of 8 bytes at `stride / sample_interval` bytes per second, so at slow time bases data
+arrives in bursts of 8 bytes (one burst every 0.64 s at 20 s per division with one channel). The state word stays
+`0xC100`. The first 11 to 16 frames after the start are stale and are discarded. If the host does not read before the
+RAM has wrapped, data is lost and the pointer alone cannot reveal it; the library estimates that from the elapsed time.
+The vendor's `dsoHTSetSampleRate` ignores its scan/roll format argument, and `dsoHTOpenRollMode`, `dsoHTCloseRollMode`
+and `dsoHTStartRoll` do nothing.
+
+## 7. Configuration
+
+### 7.1 Order of operations
+
+**Verified.** The library applies a configuration in the order of the vendor software:
+
+1. ADC register `0x55` (7.2)
+2. ADC channel-mode registers (7.2), timebase `0F` (7.3), horizontal position `10` (7.4)
+3. Relays (7.5), twice with pauses, then the ADC channel-mode registers again
+4. Trigger source `12` (8.1)
+5. Vertical position of each channel (7.6), 10 ms pause each
+6. Trigger level `07` (8.2), trigger mode `11` (8.3) and the pulse or video packet (8.4, 8.5)
+7. Gain trim `1E` (7.7)
+
+The gain trim must come last; sent earlier it has no effect.
+
+### 7.2 ADC channel mode and gain registers
+
+**Verified** for 1, 2 and 4 channels at time base indexes 3, 6, 7, 8 and 15.
+
+The ADC runs in one of three channel modes `k`, with the sample rates of the manual's table: single channel 1 GS/s, dual
+500 MS/s, quad 250 MS/s. With `n` enabled channels and time base index `t` (0 = 2 ns):
+
+| n | k |
+|---|---|
+| 3 or 4 | 4 |
+| 2 | 2 if `t ≤ 7`, else 4 |
+| 1 | 1 if `t < 7`, 2 if `t = 7`, else 4 |
+
+The per-channel gain code `g` from the vertical range index `v`:
+
+| v | 0 | 1 | 2 | 3, 6, 9 | 4, 7, 10 | 5, 8, 11 |
+|---|---|---|---|---|---|---|
+| g | `0xD` | `0xA` | `0x7` | `0x5` | `0x2` | `0x0` |
+
+HMCAD1511 registers (SPI `cs 4`), written 3 ms apart in this order:
+
+| Reg | Value |
+|---|---|
+| `0x3A` | k=4: `0x0810`. n=1, t<7: `0x1010`, `0x0808`, `0x0404`, `0x0202` for CH1 to CH4. n=1, t=7: CH1 `0x1010`, CH2 `0x0404`, CH3 `0x0404`, CH4 `0x1010`. n=2, t≤7: CH1+2 `0x1010`, 1+3 `0x1010`, 2+3 `0x0808`, 1+4 `0x1010`, 2+4 `0x0808`, 3+4 `0x0404` |
+| `0x3B` | k=4: `0x0204`. n=1, t<7: same as `0x3A`. n=1, t=7: CH1 `0x0808`, CH2 `0x0808`, CH3 `0x0202`, CH4 `0x0202`. n=2, t≤7: 1+2 `0x0808`, 1+3 `0x0404`, 2+3 `0x0404`, 1+4 `0x0202`, 2+4 `0x0202`, 3+4 `0x0202` |
+| `0x0F` | `0x0000` |
+| `0x31` | k=4: `0x0204`; k=2: `0x0102`; k=1: `0x0001` |
+| `0x2A` (k=4) | `g4<<12 \| g3<<8 \| g2<<4 \| g1` |
+| `0x2B` (k=1, 2) | build `word` (n=1: `g × 0x1111` of the enabled channel; n=2: low byte `g(first) × 0x11`, high byte `g(second) × 0x11`); then data bytes `d0 = ((hi ^ lo) & 0xF) ^ hi`, `d1 = lo & 0xF` |
+
+Once per configuration, before these: register `0x55` (SPI `cs 4`) selects a gain by the PCB revision number parsed from
+the info string. Revision 105: `0x37` (k=4), `0x0A` (k=2), `0x00` (k=1). Revision 106: `0x3F` for every mode (verified on
+the reference unit, PCB 1.06). Other revisions: `0x3F`, `0x30`, `0x19`.
+
+### 7.3 Time base
+
+**Verified.** There are 36 time bases from 2 ns to 1000 s per division in a 1-2-5 sequence, 250 samples per division.
+`0F 00 <u32>` carries `divisor − 1`. The sample interval is `ns_per_division / 250` from index 8 on; for indexes 0 to 7
+it is the ADC mode interval (1 ns for one channel, 2 ns for two, 4 ns for three or four; index 7: 2, 2, 4 ns), set by
+the ADC registers of 7.2 and not by the divisor.
+
+| Idx | Time base | `0F` payload (divisor − 1) | Sample interval |
+|---|---|---|---|
+| 0 | 2ns | 0 | 1 / 2 / 4 ns |
+| 1 | 5ns | 0 | 1 / 2 / 4 ns |
+| 2 | 10ns | 0 | 1 / 2 / 4 ns |
+| 3 | 20ns | 0 | 1 / 2 / 4 ns |
+| 4 | 50ns | 0 | 1 / 2 / 4 ns |
+| 5 | 100ns | 0 | 1 / 2 / 4 ns |
+| 6 | 200ns | 0 | 1 / 2 / 4 ns |
+| 7 | 500ns | 0 | 2 / 2 / 4 ns |
+| 8 | 1us | 0 | 4 ns |
+| 9 | 2us | 0 | 8 ns |
+| 10 | 5us | 1 | 20 ns |
+| 11 | 10us | 4 | 40 ns |
+| 12 | 20us | 9 | 80 ns |
+| 13 | 50us | 24 | 200 ns |
+| 14 | 100us | 49 | 400 ns |
+| 15 | 200us | 99 | 800 ns |
+| 16 | 500us | 249 | 2 us |
+| 17 | 1ms | 499 | 4 us |
+| 18 | 2ms | 999 | 8 us |
+| 19 | 5ms | 2499 | 20 us |
+| 20 | 10ms | 4999 | 40 us |
+| 21 | 20ms | 9999 | 80 us |
+| 22 | 50ms | 24999 | 200 us |
+| 23 | 100ms | 49999 | 400 us |
+| 24 | 200ms | 99999 | 800 us |
+| 25 | 500ms | 249999 | 2 ms |
+| 26 | 1s | 499999 | 4 ms |
+| 27 | 2s | 999999 | 8 ms |
+| 28 | 5s | 2499999 | 20 ms |
+| 29 | 10s | 4999999 | 40 ms |
+| 30 | 20s | 9999999 | 80 ms |
+| 31 | 50s | 24999999 | 200 ms |
+| 32 | 100s | 49999999 | 400 ms |
+| 33 | 200s | 99999999 | 800 ms |
+| 34 | 500s | 249999999 | 2 s |
+| 35 | 1000s | 499999999 | 4 s |
+
+Indexes 8 and 9 send divisor 1 as well; their 4 ns and 8 ns intervals follow from the nominal 250 samples per division
+and were confirmed by the rise-time measurement of Appendix A.6. The interval was measured exactly (to 1 ppm against a
+1 kHz calibrator) from index 13 to 22.
+
+### 7.4 Horizontal trigger position
+
+**Verified** at 10 %, 50 % and 90 %. `10 00 <first: 6 bytes> <second: 6 bytes>`, both values in units of 8 ns (a
+125 MHz counter), computed from the window length `B` (samples), the trigger position `h` in percent, the sample
+interval `f` in ns and the FPGA version (latency `lat`: 246 for FPGA versions `0xA000`, `0xA00A`, `0xA00B`, otherwise
+230):
+
+```
+pre    = trunc(h × B / 100)
+first  = trunc((lat + (pre + 100) × f) / 8)
+second = trunc(((B − pre + 8) × f) / 8)
+```
+
+If `f < 200` ns each result is rounded up when it has a fraction. Example: `B = 4096`, `h = 50`, `f = 800` gives
+`first = 214828`, `second = 205600`, which are the constants hard-coded in two open-source drivers. The trigger edge lands
+within a few samples of the requested position (section 10).
+
+### 7.5 Front-end relays
+
+**Verified** for all 12 ranges, the bandwidth limit and AC coupling. SPI to the shift registers (`cs 1`):
+`08 00 c1 c2 c3 c4 01 00`, one byte per channel:
 
 | Bit | Meaning |
 |---|---|
-| 7 | Bandwidth limit |
-| 6 | Range > 1 V |
-| 5 | Range ≤ 1 V |
-| 4 | Range > 100 mV |
-| 3 | Range ≤ 100 mV |
-| 2 | Coupling (1 = DC) |
-| 1 | Always set |
+| 7 | bandwidth limit on |
+| 6 | range index > 8 (above 1 V per division) |
+| 5 | range index ≤ 8 |
+| 4 | range index > 5 (above 100 mV per division) |
+| 3 | range index ≤ 5 |
+| 2 | DC coupling (cleared for AC) |
+| 1 | always 1 |
+| 0 | 0 |
 
-HMCAD1511 coarse-gain code per V/div (12 settings, 2 mV … 10 V, 1-2-5):
-`{0xD,0xA,0x7,0x5,0x2,0x0,0x5,0x2,0x0,0x5,0x2,0x0}`.
+The relays are latching: send the message, wait 4 ms, send it again with each byte `AND 0x86` (relay drive bits cleared,
+bandwidth, DC and base bits kept), wait 50 ms.
 
-### 3.4 Startup sequence (libhantek6xx4 `hantek_open_device`)
+### 7.6 Vertical position
 
-1. Claim interface 0.
-2. Bulk `0C 00` (reset); read FPGA version (first 2 bytes, LE).
-3. "Wake" SPI sequence (5 writes, e.g. `08 00 00 77 47 <LVDS_TERM reg> 04 00`).
-4. Control `0xA2`/`0x1580`: ID string; parse PCB revision and serial.
-5. Control `0xA2`/`0x1600`: calibration table; check flag `0xFBCF`.
-6. Bulk `09 00`: hardware revision.
+**Verified** for all 12 ranges in modes 1 and 4. The position word `W` of a channel is computed from the calibration table
+`T` (3.3) and the position `p` (0 to 255, 128 centred):
 
-pyhantek's setup instead replays raw ADC init packets, e.g. `08 00 00 77 47 12 04 00`,
-`08 00 00 03 00 33 04 00`, `08 00 00 65 00 30 02 00`, `08 00 00 28 f1 0f 02 00`,
-`08 00 00 12 38 01 02 00` (sleeps 2/2/2/15 ms), then PLL/config writes. Meaning of many bytes is unknown.
+```
+row = 5 if v ≤ 5; 8 if v is 6 to 8; 11 if v is 9 to 11
+m   = 4 (k=4), 2 (k=2), 0 (k=1)
+idx = m + 12 × (12 × ch + row);  a = T[idx], b = T[idx + 1]
+if v is 5, 8 or 11:  lo = a,  hi = b
+else:  avg = (a + b + 1) >> 1;  mul = 0.02 (v=0), 0.05 (v=1), 0.1 (v=2), 0.2 (otherwise)
+       d = floor((b − avg) × mul + 0.5);  lo = avg − d;  hi = avg + d
+W = trunc((hi − lo) × p / 255 + lo)
+```
 
-### 3.5 Acquisition flow (pyhantek `read_buffer`, the only end-to-end working capture)
+`W` is sent as `id 00 W_lo W_hi` (id as in section 4). The resulting zero level in ADC codes is given in section 9.
 
-1. `03 00 01 00` start capture
-2. `06 00` + 512-byte read (twice)
-3. `0D 00` + 512-byte read
-4. `0E 00 00 00`
-5. `05 00 00 80` (128 packets)
-6. ping (control `0xB2`), then bulk read 65536 bytes
+### 7.7 Gain trim (`1E`)
 
-### 3.6 Sample format
+**Verified.** 26 bytes applying the amplitude table (3.4) to the FPGA:
 
-- 8-bit unsigned samples, **4 channels interleaved byte by byte** (ch1, ch2, ch3, ch4), 16384 samples per channel per 64 KiB read (pyhantek).
-- Mid-scale about 127 (SiberK: `volts = (sample - leverPos) * 8 * voltsPerDiv / 255`, leverPos default 127; pyhantek ch1: `v/(255/8) - 3`).
-- Vendor DLL (`dsoHTGetData`) returns 16-bit buffers per channel, depth 0x2000 default, 0x4000 max.
-- Channel count vs. rate interaction (1 GS/s needs fewer channels / interleaved ADC) is not yet understood.
-
-### 3.7 Ranges (libhantek6xx4)
-
-- 12 V/div settings: 2 mV … 10 V.
-- 27 timebase settings: 2 ns … 1 s. (SiberK's app tables: 2 ns … 1000 s, scan/roll mode above index 23.)
-- 4 channels, per-channel level, bandwidth limit, AC/DC coupling.
-
-## 4. Open-source projects
-
-| Project | Value | License |
-|---|---|---|
-| [pvachon/libhantek6xx4](https://github.com/pvachon/libhantek6xx4) | Best protocol reference (C, libusb): startup, SPI map, front-end bits, status. Sample readback incomplete, some values hard-coded. Matches only PID `0x6cde`. 27 commits, last 2019 | BSD-2-Clause |
-| [danielkucera/pyhantek](https://github.com/danielkucera/pyhantek) | Only working end-to-end capture (Python, pyusb) plus a scopehal SCPI bridge. Many magic numbers. Labeled "6xx4B", experimental | None stated (reference only, do not copy) |
-| [hackhantek/hantek6004](https://github.com/hackhantek/hantek6004) | Early RE work from the Android library. Abandoned Dec 2018 | Unverified |
-| [SiberK/HANTEK_DSO_6254BD](https://github.com/SiberK/HANTEK_DSO_6254BD) | C++Builder Windows app wrapping vendor DLLs. No protocol docs, but shows call order, calibration read, tables | None stated |
-| [danielkucera/hantek-wine-driver](https://github.com/danielkucera/hantek-wine-driver) | Reportedly runs the official software under Wine (useful for tracing). Not reviewed | Not checked |
-| [sigrok Hantek 6254BD](https://sigrok.org/wiki/Hantek_6254BD) | Status "planned"; BOM and lsusb only. No 6254BC page | n/a |
-
-Vendor SDK call order (from SiberK's usage of `HTHardDll`): `dsoHTSearchDevice`, `dsoHTDeviceConnect`,
-`dsoInitHard`, `dsoHTADCCHModGain`, `dsoHTReadCalibrationData(dev, CHLevel, 28)`, `dsoHTSetSampleRate`,
-`dsoHTSetCHAndTrigger`, `dsoHTSetRamAndTrigerControl`, `dsoHTSetCHPos`, `dsoHTSetVTriggerLevel`,
-`dsoHTSetTrigerMode`, `dsoHTStartCollectData` (flags: 0x01 auto, 0x02 roll, 0x04 not collecting),
-`dsoHTGetState` (bit 0x02 = data ready), `dsoHTGetData` / `dsoHTGetScanData`.
-
-## 5. Related but NOT applicable
-
-- **OpenHantek / OpenHantek6022, sigrok `hantek-6xxx`, Hantek6022API:** 6022 family only. Different
-  protocol (vendor requests `0xE0`–`0xE5`, host-uploaded fx2lafw firmware, VID `04b4/04b5/1d50`, EP `0x86`).
-- **mikrocontroller.net "Hantek Protokoll":** DSO5xxxB/DST1xxxB family, framed protocol (`0x53` marker, checksum),
-  VID `049f:505a`, EP `0x01/0x82`. Does not mention the 6xxx series.
-
-## 6. Gaps and risks
-
-1. 6254BC USB ID and PCB revision unconfirmed.
-2. ADC/PLL init is partly replayed magic bytes; the HMCAD1511 register map (`hmcad1511.h` in libhantek6xx4) was not reviewed.
-3. FPGA behavior unknown: horizontal trigger position, pre-trigger depth, memory depth, interleave at 1 GS/s, pulse/video triggers.
-4. Calibration data is read by both projects but not fully applied.
-5. **Brick risk:** a 6204BD FX2 was bricked by flashing OpenHantek 6022 firmware; a 6104BC was bricked and recovered by writing a 6074BC EEPROM dump. Back up the 24LC64 before any write.
-6. Windows driver signing affects only the official software; Linux libusb needs just a udev rule.
-7. pyhantek and SiberK have no license; only libhantek6xx4 (BSD-2) can be reused, with attribution.
-8. Conflicting reports on the VID the software opens (`04b4` vs `04b5`); verify by capture.
-
-## 7. Sources
-
-- sigrok: [Hantek 6254BD](https://sigrok.org/wiki/Hantek_6254BD), [Info](https://sigrok.org/wiki/Hantek_6254BD/Info)
-- [EEVblog: Hantek 6254BD 250MHz 1GSa/s PC/USB DSO](https://eevblog.com/forum/testgear/hantek-6254bd-250mhz-1gsas-pcusb-dso) (pages 1–2 read)
-- [libhantek6xx4](https://github.com/pvachon/libhantek6xx4), [pyhantek](https://github.com/danielkucera/pyhantek), [SiberK repo](https://github.com/SiberK/HANTEK_DSO_6254BD)
-- [libsigrok hantek-6xxx](https://github.com/sigrokproject/libsigrok/tree/master/src/hardware/hantek-6xxx), [Hantek6022API](https://github.com/Ho-Ro/Hantek6022API)
-- [mikrocontroller.net Hantek Protokoll](https://www.mikrocontroller.net/articles/Hantek_Protokoll)
-
-## 8. Findings from decompiling the vendor `HTHardDll.dll` (x86)
-
-Source: `docs/HT6004BX_SDK/Dll/x86/HTHardDll.dll` (98 304 bytes, May 2018), decompiled with Ghidra
-headless (`docs/tools/ExportDecomp.java`, run with `analyzeHeadless … -postScript ExportDecomp.java <out.c>`),
-plus the SDK headers (`HeadFiles_UTF8/*.h`), the English manual and the QTDSO demo. Function names
-below are exported names; internal helpers are Ghidra `FUN_<addr>` names. Items are *from the vendor
-code* (strongest evidence so far) but still **not yet replayed on our unit** unless stated.
-
-### 8.1 How the DLL talks to the device
-
-`HTHardDll.dll` imports only KERNEL32 (`CreateFileA`, `DeviceIoControl`, ...) and `HTSoftDll.dll`. It
-never touches USB directly: it opens the Windows kernel driver (`Hantek6000BX86.sys`) and uses three
-private IOCTLs. Everything else is built in the DLL.
-
-| IOCTL | Meaning | Helper |
-|---|---|---|
-| `0x222051` | Bulk **OUT** write to EP `0x02` (input buffer = 4 zero bytes, "output" buffer = the command bytes) | `FUN_10001a80(dev, len, buf)` |
-| `0x22204E` | Bulk **IN** read from EP `0x86` | `FUN_10001b40(dev, len, buf)` |
-| `0x222059` | Vendor **control** transfer; 10-byte header | `FUN_10001180(dev, bRequest, wValue, dir, buf, len)` |
-
-Control header (10 bytes): `[0]=dir (1 read, 0 write) [1]=0x02 [2..3]=0 [4]=bRequest [5]=0 [6..7]=wValue (LE) [8..9]=0`.
-Reads/writes longer than 1024 bytes are split in 0x400 chunks with `wValue += offset`.
-
-**Every bulk write is preceded by** `FUN_10001290(dev, 1)`: control OUT `0xB3` with 10 bytes then control IN
-`0xB2` (10 bytes). The `0xB3` payload is the "transfer mode" and depends on the mode argument:
-
-| mode | payload (first 4 bytes) |
+| Bytes | Content |
 |---|---|
-| 1 (default, used before bulk writes) | `0f 03 03 03` |
-| 2 | `0f 0a 0a 0a` |
-| 3 | `0f 09 09 09` |
-| 4 | `0f 01 01 01` |
-| 5 | `0f 02 02 02` |
-| 6 | `0f 08 08 08` |
+| 0..1 | `1e 00` |
+| 2..9 | four trims `t0..t3` (u16) |
+| 10..25 | for each trim `ti ≠ 0x400`, a 4-byte offset word at `10 + 4i`: `trunc(p' × (1024 − ti) + 0.5)` (add `0x2000000` if negative), with `p' = trunc((position − 128) × 0.78125 + 128.5)`; zero otherwise |
 
-(rest zero). Reading: `FUN_10001360` does control IN `0xB2`; byte 0 non-zero means high speed, so
-every bulk **read** size is **0x200 (512)** if byte0 != 0, else **0x40 (64)**. This confirms libhantek6xx4's
-`0xB3`/`0xB2` behaviour. Our unit returned `01` (high speed, 512-byte packets).
+Which channel supplies the trim and the position for the four slots depends on the number of enabled channels `n`:
+`n = 1`: the enabled channel for all four; `n = 2`: the first enabled channel's trim for all four slots and positions
+`[first, first, second, second]`; `n = 3` or `4`: each channel its own. The trim is looked up with the channel mode `k` of
+7.2 as the slot, so one channel at a time base index above 7 uses slot 2.
 
-### 8.2 Control requests used by the DLL (`FUN_10001180` call sites)
+The FPGA multiplies the samples by `t / 1024` around the zero level (verified: a trim of `0x440` raised a signal above
+zero by 1.06 while the zero stayed at code 128). The setting persists across acquisitions. The table values correct
+per-channel gain differences of the analog front end; they are not volts-per-count constants.
 
-| bRequest | wValue | dir | len | Purpose |
-|---|---|---|---|---|
-| `0xB3` | 0 | W | 10 | Transfer-mode preamble (above) |
-| `0xB2` | 0 | R | 10 | Ready / high-speed flag |
-| `0xEA` | 0 | W | 10 | `dsoSetUSBBus` — switch the bus path to USB (first thing in init) |
-| `0xE5` | 0 | W | 10 | `dsoSetSPIBus` |
-| `0xA2` | `0x1580` | R/W | 0x47 | Info string (device name/PCB/serial); `dsoGetHardInfo`/`dsoSetHardInfo` |
-| `0xA2` | `0x15E0` | R/W | n*2 | User/driver-info area (`dsoGetDriverVersion`, `dsoReadIIC`/`WriteIIC`) |
-| `0xA2` | `0x1600` | R/W | 2n | Calibration table (`dsoHTReadCalibrationData`/`Write…`) |
-| `0xA2` | `0x1B00` | R/W | 2n | Second calibration table (`dsoHTRDAmpCali`/`WRAmpCali`); validity flag `0xFACF` |
-| `0xA2` | `0x1D80` | R/W | 2n | Third table (DDS/AWG calibration, `dsoGetDDSCali`/`dsoSetDDSCali`) |
-| `0xEC` / `0xED` | `0x1700`, `0x1716` | W / R | 0x14, 1 | LAN settings (`dsoUSBModeSetIPAddr`/`GetIPAddr`, `dsoSetLANEnable`/`GetLANEnable`); `0xED` stalls on the 6254BC (10.12) |
-| `0xE3` | `0x15F0` | R | 4 | Driver/firmware version as 8 BCD digits (`dsoGetDriverVersion`); `20 16 05 31` on the 6254BC (10.12) |
-| `0xF4` | `0x1F00` | R | 2 | USB module version (`dsoGetUSBModulVersion`); stalls on the 6254BC (10.12) |
-| `0xF0` / `0xF1` | `0x1E00` | W / R | 0x40 | **Flash read/write** (`dsoWriteFlash`/`dsoReadFlash`, FPGA bitstream) — **never write** |
+## 8. Triggers
 
-Info string slices used by the DLL (offsets into the 71 bytes at `0xA2/0x1580`): device name `[6..14)`,
-PCB version `[14..20)`, serial `[34..42)`. On our unit that gives name `6000`, PCB `P1.06`, serial `64C02153`
-(slice looks suspect, see §1a); the PCB string is parsed to a number (`1.06` → 106) to pick ADC gain codes.
+### 8.1 Trigger source routing
 
-### 8.3 Bulk commands (EP `0x02`), exactly as built by the DLL
+**Verified** for the tested channel and time base combinations. `12 00 b2 00 b4 b5` with the time base index `t`,
+channel mask `m` (CH1 = bit 0), source channel `s`, peak-detect flag `p` (always 0 here), `n` enabled channels and
+`uv = m >> s`:
 
-All numbers little-endian. Writes are followed by the `0xB3`/`0xB2` control pair described above.
+```
+b2 = (p << 6) | (m << 2) | x
+b4 = y & 3
+b5 = ((~uv & 1) << 2) | z
+n = 1:    x = 0 (t<7), 1 (t=7), 2 (t=8), 3 (t>8);  y = 3 − x
+n = 2:    x = 0 (t<8), 1 (t=8), 2 (t>8);           y = 2 − x
+n = 3, 4: x = (t > 8);                              y = 1 − x
+z = 0 (k=1);  k=2: n=1 ? (m is CH1 or CH3 ? 0 : 1) : (uv == 1);  k=4: s
+```
 
-| Cmd | Bytes | Built by / meaning |
+### 8.2 Trigger level
+
+**Verified.** The level is an ADC code (0 to `0xE4`) compared with the raw samples; use the zero model of section 9 to
+convert a voltage. `07 00` followed by four groups `hi hi lo lo` and eight copies of `mid`, where `mid` is the level,
+`hi = min(mid + 4, 0xE4)` and `lo = max(mid − 4, 0)` (a ±4 code hysteresis band). The vendor API takes a position
+`nPos` (0 to 255) and maps it with `mid = trunc(nPos × 200 / 256 + 28.5)`.
+
+### 8.3 Trigger mode
+
+**Verified.** `11 00 mode slope coupling 00`: mode `0` edge, `1` pulse, `2` video (vendor: CAN `0x0B`, LIN `0x0A`, UART
+`0x09`, SPI `0x0C`, I2C `0x0D`, force `0x80`; not implemented); slope `0` rising (for pulses: positive), `1` falling
+(negative); coupling `0` DC (the vendor API also defines AC, low-frequency, high-frequency and noise rejection, untested).
+The edge trigger fires on the configured slope when the signal crosses the level.
+
+### 8.4 Pulse trigger
+
+**Verified** with the 1 kHz calibrator (500 µs pulses), after the mode command with mode `1`. `13 00 <a: u32> <1.05a: u32>
+<0.95a: u32> <cond << 1> 00`, 16 bytes, with `a = trunc(width_ns × 0.125)` (units of 8 ns) and `cond` 0 equal, 1 not
+equal, 2 greater, 3 less. The accepted width range is 10 ns to 10 s. "Equal" accepts widths within ±5 %.
+
+The vendor header documents the width in units of 5 ns, which would give `width_ns / 40`; with that the hardware saw
+pulses five times too wide, so the argument is effectively in nanoseconds. Test results are in Appendix A.5. The capture is
+aligned to the leading edge of the pulse, like an edge trigger.
+
+### 8.5 Video trigger
+
+**Vendor**, not verified with a video signal (the device accepts it, never triggers on the calibrator, and works normally
+afterwards). After the mode command with mode `2`: `16 00 <c_lo> <b3> <level+2> <level−2> 5b 0e 3b 0d 4b 02 2c 01 <src> 32`,
+16 bytes, where
+
+- `counter` is the hardware line counter of the 1-based line number, `c_lo` its low byte;
+- `b3 = ((positive << 3 | sync) << 3) | ((counter >> 8) & 3)`; `positive` = 1 for positive sync polarity; `sync` = 0 all
+  lines, 1 line number, 2 odd field, 3 even field, 4 all fields (the line number is 1 for the modes that do not use one);
+- `level` is the trigger level as for 8.2; the bytes `5b 0e 3b 0d 4b 02 2c 01` are fixed timing constants copied from the
+  vendor code; `src` (logic trigger source) is 0.
+
+The line counter mapping (16-bit arithmetic):
+
+| Standard | Line `n` | Counter |
 |---|---|---|
-| `0C 00` | 2 | Reset; then bulk read: first u16 = **FPGA version** (`FUN_100055c0`, cached) |
-| `09 00` | 2 | Hardware version; bulk read, first u32 (`dsoGetHardVersion`) |
-| `06 00` | 2 | **State**; bulk read, first u16: bit0 triggered, bit1 data ready, bit3 pack state (`dsoHTGetState`, `GetPackState`) |
-| `18 00` | 2 | Init SDRAM (`dsoHTInitSDRam`) |
-| `03 00 m 00` | 4 | **Start collect**; `m = nStartControl & 0x7F` (bit0 auto, bit1 roll, bit2 stop after) |
-| `0D 00` | 2 | **Buffer status**; reads u16@0, u16@2 (trigger address), byte@4, u16@6, u16@8 |
-| `0E 00 lo hi` | 4 | Set readback start address (computed from trigger address, pre-trigger, buffer length) |
-| `05 00 lo hi` | 4 | **Read back** `n` bytes: value = `n/2` (u16). Data then arrives on EP `0x86` in 512-byte (or 64) packets |
-| `08 00 00 d0 d1 reg cs 00` | 8 | SPI write: 16-bit `d1:d0`, register `reg`, chip select `cs` (1 front-end shift regs, 2 ADF4360-7, 4 HMCAD1511) |
-| `0F 00 <u32>` | 6 | Timebase (sample-rate divider), see §8.5 |
-| `00/01/02/04 00 lo hi` | 4 | Channel vertical position; id = `0` for CH1 else `1<<(ch-1)` (CH2=1, CH3=2, CH4=4); 10 ms sleep after |
-| `07 00 …` | 26 | Trigger level, see §8.6 |
-| `10 00 …` | 14 | Horizontal trigger/pre-trigger length (two 40-bit values), see §8.7 |
-| `11 00 mode slope coupling 00` | 6 | Trigger mode (`FUN_` in `dsoHTSetTrigerMode`) |
-| `12 00 b2 00 b4 b5` | 6 | Trigger source / channel / mode bits, see §8.8 |
-| `13 00 …` | 16 | Pulse-width trigger (`dsoHTSetPulseTriger`) |
-
-Trigger mode wire values (`11 00 mode …`): edge `0`, pulse `1`, video `2`, CAN `0x0B`, LIN `0x0A`, UART `0x09`,
-SPI `0x0C`, I2C `0x0D`, force `0x80`. `slope`: rise 0 / fall 1. `coupling` is passed through
-(0 DC, 1 AC, 2 LF reject, 3 HF reject, 4 noise reject per the manual).
-Pulse trigger packet (`13 00`): three u32 fields at bytes 2–5, 6–9, 10–13 (derived from the pulse width by float math,
-width unit is 5 ns / 10 ns per the manual), byte 14 = `condition << 1`, byte 15 = 0. Constants for the float math not decoded yet.
-
-### 8.4 Initialization sequence (`dsoInitHard` → `FUN_100081b0` + `FUN_10001d30`)
-
-1. Control OUT `0xEA` (`dsoSetUSBBus`), 10 bytes (content not significant).
-2. Bulk `0C 00` reset, bulk read → FPGA version (u16).
-3. Control IN `0xA2/0x1580` → info string (0x47 bytes).
-4. Read DDS calibration (`0xA2/0x1D80`), amplitude calibration, ADC calibration tables (`0xA2/0x1B00`, `0x1600`);
-   if a table fails its validity flag (`0xFBCF` for `0x1600`, `0xFACF` for `0x1B00`) the DLL substitutes defaults
-   (value `0x400`; some default blocks use `0x40DA, 0xEACF, 0x4478, 0xE741, 0x452E, 0xE614`).
-5. ADC/PLL bring-up over SPI (confirms pyhantek's bytes):
-   - `08 00 00 77 47 12 04 00` (HMCAD1511 reg `0x12`, value `0x4777`), sleep 2 ms
-   - `08 00 00 03 00 33 04 00` (HMCAD1511 reg `0x33`, value `0x0003`)
-   - then, with `cs = 2` (ADF4360-7), each followed by the sleep before it: `08 00 00 65 00 30 02 00` (sleep 2),
-     `08 00 00 28 f1 0f 02 00` (sleep 2), `08 00 00 12 38 01 02 00` (sleep 15)
-6. Application then calls `dsoHTADCCHModGain`, calibration reads, `dsoHTSetSampleRate`, `dsoHTSetCHAndTrigger`,
-   `dsoHTSetRamAndTrigerControl`, `dsoHTSetCHPos` per channel, `dsoHTSetVTriggerLevel`, `dsoHTSetTrigerMode`
-   (the QTDSO demo `Hard::Init` does exactly this order).
-
-### 8.5 Timebase divider (`0F 00 <u32>`, `FUN_10002330`)
-
-Payload is `divisor − 1` (u32 LE) with `divisor` chosen by timebase index (0 = 2 ns … 35 = 1000 s):
-
-| idx | 0–9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35–36 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| divisor | 1 | 2 | 5 | 10 | 25 | 50 | 100 | 250 | 500 | 1000 | 2500 | 5000 | 10000 | 25000 | 50000 | 100000 | 250000 | 500000 | 1e6 | 2.5e6 | 5e6 | 1e7 | 2.5e7 | 5e7 | 1e8 | 2.5e8 | 5e8 |
-
-This matches pyhantek (`raw = 250e6/rate/2 − 1`, e.g. 200 µs/div → 99) and the manual's "sample rate = 250 / timebase"
-(250 points per grid). Indices 0–9 (2 ns … 2 µs) all send `0`; the actual 1 GS/s / 500 MS/s interleave for the fastest
-bases is done by the ADC channel-mode registers (§8.9), plus software interpolation (DefMacro: `MAX_INSERT_TIMEDIV = 6`).
-Sample-rate by channel mode (manual Table 1): idx 0–6 single channel 1 GS/s, dual 500 MS/s, quad 250 MS/s;
-idx 7 dual 500 MS/s, quad 250 MS/s; idx ≥ 8 250 MS/s / divisor.
-
-### 8.6 Trigger level (`07 00 …`, 26 bytes, `FUN_10001dc0`)
-
-`mid = f(nPos)` (float math, `nPos` 0–255), `hi = min(mid + sens, 0xE4)`, `lo = max(mid − sens, 0)` with `sens` = `nSensitivity`
-(demo passes 4). Layout: bytes 0–1 `07 00`; then four groups `hi hi lo lo` (bytes 2–17); then eight bytes of `mid` (bytes 18–25).
-The `mid(nPos)` mapping is not decoded (pyhantek uses `((V+1)/4)*200 + 28.5`; "28.5" matches the `32.5`/`28` offsets seen in the DLL, to verify).
-
-### 8.7 Horizontal trigger / pre-trigger length (`10 00 …`, 14 bytes, `FUN_10002060`)
-
-Two 40-bit little-endian values (bytes 2–6 and 8–12 each with a high byte; bytes 7 and 13 hold bits 40–47 as written),
-computed from buffer length (`FUN_10001450`: **0x10000 (64K)** normally, **0x8000 (32K)** for buffer-index 3–7),
-the horizontal trigger position (%), channel mode and timebase. Details are float-heavy and still to decode; both
-open-source projects hard-code the two values.
-
-### 8.8 Trigger source (`12 00 b2 00 b4 b5`, `FUN_100095d0`)
-
-Inputs: timebase idx `t`, channel mask `m` (CH1 = bit0), trigger source `s`, peak-detect flag `p`; `n` = number of enabled channels.
-- `b2 = ((p & 1) << 6) | ((m & 0xF) << 2) | x`
-- `b4 = y & 3`
-- `b5 = ((~(m >> s) & 1) << 2) | z`
-- `x, y, z` depend on `n` and `t`: `n=1`: `x = 0 if t<7; 1 if t==7; 2 if t==8; 3 if t>8`, `y = 3 − x`;
-  `n=2`: `x = 0 if t<8; 1 if t==8; 2 if t>8`, `y = 2 − x`; `n=3,4`: `x = (t>8)`, `y = 1 − x`.
-  `z` derives from the channel mode (1: 0; 2: `(n==1 ? (m is CH1 or CH3 ? 0 : 1) : (m>>s)&1 == 1)`; 3/4: `s`).
-(Reading of the decompiler output; double-check against a trace.)
-
-### 8.9 Front-end relays and ADC channel mode
-
-**Shift register** (`dsoHTSetCHAndTrigger` → `FUN_100030b0`): message `08 00 c0 c1 c2 c3 01 00` (cs = 1). Per channel byte:
-bit7 bandwidth-limit, bit6 range > 1 V (vdiv idx > 8), bit5 range ≤ 1 V, bit4 range > 100 mV (idx > 5), bit3 range ≤ 100 mV,
-bit2 DC coupling (coupling == 0), bit1 always 1, bit0 0. The DLL waits on a busy flag (`FUN_10001c90`), sends the
-message, sleeps **4 ms**, then sends it **again with each byte `& 0x86`** (relay-drive bits cleared, bandwidth bit and
-coupling/base bits kept), then sleeps **50 ms**. So the relays are pulsed (latching relays), not "latch 0 then 1" as
-libhantek6xx4 describes — an earlier note in §3.3 should be read with this correction.
-
-**HMCAD1511 configuration** (`FUN_10002830`, called from `SetCHAndTrigger` and `SetSampleRate`): per-channel gain code by
-vdiv idx: `0→0xD, 1→0xA, 2→0x7, 3/6/9→0x5, 4/7/10→0x2, else 0` (matches libhantek6xx4's table, with 12 vdivs 2 mV…10 V),
-packed into a 16-bit word (one nibble per channel). Then SPI writes with `cs = 4`, `reg` / value depends on the number of
-enabled channels and the timebase:
-- reg `0x3A` and `0x3B`: input-select words (`0x1010 / 0x0808 / 0x0404 / 0x0202` etc. one-hot per enabled channel;
-  quad mode `0x810` and `0x204`), 3 ms sleeps between writes
-- reg `0x0F`: `0x0000`
-- reg `0x31`: channel mode word (`0x0001` single, `0x0102` dual, `0x0204` quad)
-- reg `0x2A` (quad mode) or `0x2B` (single/dual): the packed gain nibbles
-`dsoHTADCCHModGain(dev, nCHMod)`: `08 00 00 g 00 55 04 00` (reg `0x55`, cs 4) where `g` depends on the PCB revision parsed from the
-info string: rev 105 → `{1ch:0x00, 2ch:0x0A, 4ch:0x37}`; rev 106 → computed as `clamp(k·333.33 + 32.5, 0, 63)` with
-`k = 1.10, 1.08, 0.95` which all clamp to **63 (0x3F)**; other revisions → `{0x19, 0x30, 0x3F}`. **Our unit is PCB 1.06 → `0x3F` for all channel modes**
-(matches pyhantek's `08 00 00 3f 00 55 04 00`).
-
-### 8.10 Capture and data read (`dsoHTGetData` → `FUN_10004100`, `FUN_100041f0`, `FUN_10004240`)
-
-1. Start: `03 00 m 00`; poll `06 00` until `state & 2`.
-2. `0D 00` → buffer status (trigger address in u16@2, etc.).
-3. `0E 00 lo hi` with the computed read start address (address is wrapped by the buffer length 64K/32K, rounded to a multiple of 8, adjusted by channel mode).
-4. `05 00 lo hi` with `n/2`, then bulk-read `n` bytes in 512-byte (or 64-byte) packets.
-5. De-interleave: samples are **one byte per channel**, interleaved in groups of *k* bytes where *k* = number of enabled channels
-   (1, 2 or 4; 3 enabled channels use the 4-channel layout). The DLL widens each byte to `WORD`.
-Zero level: the demo's `SourceToDisplay` computes `sample − (255 − leverPos)` with `leverPos` (CH1 default 192, CH2 160, CH3 96, CH4 64) = channel position (0–255).
-Buffer lengths: `BUF_4K_LEN` (the demo reads 4096 samples). Scan (`dsoHTGetScanData`, timebase ≥ 25) and roll
-(`dsoHTGetRollData`, ≥ 27) modes use the same primitives with incremental reads.
-
-### 8.11 AWG / DDS (`dds*` exports, not decoded, not implemented)
-
-**The 6254BC has no signal generator output** (confirmed on the unit used for this work), and its generator calibration
-areas are blank: `0xA2/0x1D80` reads all `0xFF`, and the DDS calibration word the vendor code expects at `0xA2/0x15E0`
-(`dsoGetDDSCali`, word 1) is `0xFFFF`, so the DLL would fall back to its default. The generator exists in the SDK because
-it is shared with other models (the DAC902E generator is reported for the 6254BD). The library does not implement it: it
-cannot be tested here and sending DDS commands to a device without the hardware has unknown effects on the FPGA. The SDK API is: `ddsSetOnOff`, `ddsSetFrequency`, `ddsDownload` (wave RAM, 12-bit points),
-`ddsSetCmd` (0 continuous / 4 burst / 1 single), `ddsSDKSetFre/Amp/Offset/BurstNum/WaveType (0 sin, 1 ramp, 2 square, 4 DC, 8 noise)/WavePhase/WaveDuty`,
-`ddsSetSweep`, `ddsSetFAOC`, `ddsSetSyncOut`, `ddsSetAMFMFreq`. Functions are at `0x100086a0`–`0x10009120` in the decompile for later work.
-
-### 8.12 Corrections to earlier sections
-
-- §3.3: the relay update sends the register image twice (full, then `& 0x86`) with 4 ms / 50 ms sleeps; it is not a 0/1 latch.
-- §3.1: control `0xEA` is `dsoSetUSBBus` (write), `0xE5` is `dsoSetSPIBus`; `0xF0/0xF1 0x1E00` are the flash write/read requests (FPGA bitstream) — avoid.
-- §3.2: `0x18 00` (init SDRAM) and `0x13 00` (pulse trigger) are real; `0x1E…` in pyhantek is not seen in the vendor DLL.
-- §1a info string: serial slice is `[34..42)` and name `[6..14)`, PCB `[14..20)` per the DLL.
-
-### 8.13 Still unknown / to decode next
-
-1. `mid(nPos)` trigger level mapping (§8.6) and the exact `10 00` horizontal-position fields (§8.7): need the float constants from `.rdata` at `0x10012100`–`0x10012360`.
-2. `dsoHTSetCHPos` mapping from `(vdiv, pos, channel mode)` to the 16-bit offset, which uses the calibration table (`0xA2/0x1600`, layout 9 points × 4 channels × …).
-3. Buffer-address arithmetic in `dsoHTGetData` (§8.10, step 3) and sample interpolation (`HTSoftDll.dll`).
-4. Pulse/video/serial triggers (`13 00`, `dsoHTSetVideoTriger`).
-5. Calibration table layout and write path (`dsoHTSetAmpCalibrate`, `dsoHTWriteCalibrationData`), and AWG (`dds*`).
-6. What `0xEC/0xED/0xE3/0xF4` read/write.
-7. Replay on our unit: bulk `0C 00`, `09 00`, `06 00`, then the init sequence above and one capture.
-
-## 9. Replay on our 6254BC unit (2026-11-20) — VERIFIED
-
-Throwaway probe: `docs/tools/replay_probe/` (Rust + rusb; `cargo run --release -- <stage>`). It implements the
-vendor-DLL transport from §8.1 with direct libusb calls (vendor control `0xB3`/`0xB2` before every bulk write,
-512-byte bulk reads). No EEPROM/flash writes were made. Stages: 1 = reset/versions/state, 2 = + init, 3 = + configure + capture.
-
-**Verified working:**
-- Bulk `0C 00` reset → first u16 of the reply = FPGA version **`0xD001`** (reply is a 512-byte packet repeating `01 d0`).
-- Bulk `09 00` hardware version → all zero on this unit.
-- Bulk `06 00` state → first u16: `0x0000` before init; after the ADC/PLL init `0x8402`; after start-collect `0xC100`; when data is ready `0xC402`
-  (bit1 = data ready as documented; other bits not decoded). The reply is a full 512-byte packet; the state is in the first bytes.
-- SPI init (§8.4: HMCAD1511 `0x12`/`0x33`, ADF4360 `0x30`/`0x0F`/`0x01`, ADC gain reg `0x55` = `0x3F`) accepted, no errors.
-- Full configuration with the decoded commands (timebase idx 15 = `0F 00 63 00 00 00`, ADC 4-channel mode regs `3A/3B/0F/31/2A`,
-  relays `08 00 36 36 36 36 01 00` then `… 06 06 06 06 01 00`, trigger source `12 00 3d 00 00 00`, channel positions, trigger level,
-  trigger mode `11 00 00 00 00 00`, horizontal position `10 00 …`) followed by `03 00 01 00` start.
-- Capture: data ready after < 200 ms; `0D 00` status reply `f8 70 20 91 07 12 55 55 f8 70 20 91`; then `0E 00 00 00` + `05 00 00 80`
-  returned **65 536 bytes** (128 × 512) in one bulk read sequence. 4 channels interleaved byte-by-byte; with nothing connected each
-  channel is a constant level set by the channel position: CH1 101, CH2 124, CH3 109, CH4 128 (positions `0x6201`, `0x7064`, `0x6980`, `0x72D9`
-  taken from the pyhantek capture — the formula for these is still undecoded).
-
-**Observed differences vs. the vendor DLL:**
-- Control `0xEA` OUT with 10 zero bytes **stalls (`Pipe`)** on our unit. Everything works without it, so it is not required (the DLL passes an
-  uninitialised 10-byte stack buffer; maybe it needs particular content or is an IN request). Treat as optional.
-- The device already answered state/versions before init, so the reset `0C 00` alone is enough to talk to it.
-
-**Not yet verified:** a real signal capture (calibrator), the trigger level/position math, other timebases and channel modes, trigger types,
-roll/scan modes, and the AWG.
-
-### 9.1 Real-signal capture and position sweep (2026-11-20, test signal on CH1)
-
-Setup: probe-compensation output on CH1, stage 3 settings (4-channel mode, 1 V/div relays `0x36`, timebase idx 15, auto trigger).
-- CH1 captured a clean square wave: two plateaus at counts ≈ 103 and ≈ 149 (~8 000 samples each), edges spaced exactly **625 samples**,
-  full period **1250 samples**. With a 1 kHz signal this proves **1.25 MS/s** for timebase idx 15 in 4-channel mode, i.e. the divider table of §8.5
-  (`0F 00 63 00 00 00` ⇒ 250 MS/s / 200 = 1.25 MS/s... as in the vendor manual: 250 points per grid).
-- One bulk readback of `05 00 00 80` = 65 536 bytes = 16 384 samples per channel = 13.1 ms at that rate (about 6.5 grid divisions of 2 ms).
-- Amplitude: 46 counts peak-to-peak. With the vendor/pyhantek scale of 32 counts per division at 1 V/div (255 counts = 8 div) that is about 1.4 V p-p;
-  the real calibrator amplitude is still to be confirmed.
-- CH2–CH4 (nothing connected) stay flat; tiny noise of ±1 count on CH2 (crosstalk from CH1).
-
-**Channel position word** (`0x00/0x01/0x02/0x04 00 lo hi`), measured on unconnected CH4 (1 V/div, 4-channel mode):
-
-| word | level (counts) | | word | level |
-|---|---|---|---|---|
-| `0x2000` | 0 (clipped) | | `0x6800` | 112 |
-| `0x2800` | 8 | | `0x7000` | 125 |
-| `0x3000` | 21 | | `0x7800` | 138 |
-| `0x4000` | 47 | | `0x8000` | 151.5 |
-| `0x5000` | 73 | | `0x9000` | 178 |
-| `0x6000` | 99 | | `0xA000` | 204 |
-
-It is **linear: ≈ 13 counts per 0x800, i.e. `word ≈ 8980 + 157.5 × level`** (mid-scale 128 ⇒ ≈ `0x71D4`; CH4's pyhantek value `0x72D9` gave 128–130).
-The vendor DLL derives the word from the calibration table (`0xA2/0x1600`, 576 u16 = 4 channels × 12 vdivs × 12 entries, indexed by channel,
-vdiv group and channel mode, using adjacent pairs `a,b` per entry) and `nPos`; the slope/offset above are valid for this range only
-and may change with V/div, so the calibrated formula is still to decode.
-
-**Trigger level** (decoded from `FUN_10001dc0`): `mid = trunc(nPos × 200/256 + 28.5)` (nPos 0–255), `hi = min(mid + sens, 0xE4)`,
-`lo = max(mid − sens, 0)`, sens = `nSensitivity` (demo: 4). Packet `07 00` + 4×`hi hi lo lo` + 8×`mid`. This replaces the unexplained pyhantek formula.
-
-### 9.2 Trigger, buffer status and horizontal position — VERIFIED (2026-11-20)
-
-Test: 1 kHz square wave (≈103/149 counts) on CH1, 4-channel mode, 1 V/div, timebase idx 15 (800 ns per sample), rising edge on CH1,
-buffer length B = 4096 samples, normal (non-auto) trigger `03 00 00 00`.
-
-**Trigger level.** `07 00` packet carries ADC count units: with `mid` (§9.1 formula) the capture completes only when `mid` lies between the
-signal plateaus (levels 103–141 triggered; 153+ and ≤ 91 did not). So `mid ≈ ADC counts` (0…`0xE4`), not an inverted display scale.
-
-**Status word (`06 00`, first u16).** `0xC200` armed/waiting; `0xC100` just started; **`0xC403` = triggered (bit0) + data ready (bit1)**;
-`0xC402` = data ready without trigger (auto mode / forced). In normal mode with no trigger the state never gets bit1.
-
-**Buffer status (`0D 00`, 12 useful bytes).** After a triggered capture: `u16@0` = **byte address of the trigger edge** in the 64 KiB capture
-RAM (measured: within ~20 bytes of the edge found in a full-buffer readback), `u16@2` = end address = `u16@0 + 0x2028` for B = 4096 at this
-setting (8232 bytes = 2058 frames post-trigger), byte@4 `06`/`07`, byte@5 `0x13`, `u16@6` = `0x5555`, `u16@8` = copy of `u16@0`. If not triggered,
-`u16@0/@2` are stale and unrelated.
-
-**Horizontal trigger position (`10 00`, 14 bytes)** — decoded from `FUN_10002060` and verified at 10 %, 50 % and 90 %:
-- inputs: buffer length `B` (samples, ≤ 64 K; demo = 4096), horizontal position `h` in %, sample interval `f` in ns (= 1/sample-rate:
-  1/2/4 ns for timebase idx ≤ 7 by 1/2/4 channels, then 4, 8, 20, 40, 80, 200, 400, 800 … ns for idx 8…), FPGA version → latency `lat`
-  (**230** for our FPGA `0xD001`; **246** only for FPGA versions `0xA000`/`0xA00A`/`0xA00B`).
-- `pre = trunc(h · B / 100)`
-- `first  = trunc((lat + (pre + 100) · f) / 8)` and `second = trunc(((B − pre + 8) · f) / 8)`; if `f < 200` each result is rounded **up** when it has a fraction.
-- packet: `10 00`, `first` as 6-byte LE, `second` as 6-byte LE (units of 8 ns = 125 MHz clock).
-- check: B = 4096, h = 50, f = 800 → `first = 214828`, `second = 205600`, identical to the constants hard-coded in pyhantek/libhantek6xx4.
-- measured (rising edge position in the 4096-sample window): h = 10 % → frame 403–404 (ideal 409); h = 50 % → 2042–2043 (2048); h = 90 % → 3680–3681 (3686).
-  The trigger lands about 5 frames (≈ 4 µs at this rate) earlier than ideal in every case, jitter ±1–2 frames.
-
-**Trigger-aligned readback** (verified): after the status word shows ready,
-1. `0D 00` → read status, `end = u16@2`;
-2. `start = (end − 4·B·?) mod 0x10000`, aligned down to a multiple of 8 — with 4 channels `start = (end − 4·B) & 0xFFFF & ~7` (= `end − 16384` for B = 4096);
-3. `0E 00 lo hi` with `start`;
-4. `05 00 lo hi` with `value = (4·B)/2` (= `0x2000` for 4096 samples × 4 channels) → read `4·B` bytes (512-byte packets).
-The 4096-sample window then has the trigger edge at `h` % of the window. For fewer channels the byte count per sample frame is the channel count
-(1, 2 or 4); the exact end-address arithmetic for 1/2-channel modes still has to be checked against the DLL (`dsoHTGetData`).
-Reading the whole RAM with `0E 00 00 00` + `05 00 00 80` (64 KiB, as pyhantek does) also works but the trigger edge sits at an arbitrary place (`u16@0`).
-
-## 10. Full configuration model — implemented and VERIFIED (2026-11-20)
-
-Reference implementation of everything below: `docs/tools/config_probe/src/main.rs` (`cargo run --release -- modes|pos|fast`).
-It follows the vendor DLL order of `Hard::Init`: ADC gain reg → sample rate (ADC regs, timebase `0F`, horizontal `10`) → relays + ADC regs
-→ trigger source `12` → channel positions → trigger level `07` → trigger mode `11` → start `03`.
-
-### 10.1 Data layout (VERIFIED)
-
-The readback stream has **one byte per enabled channel per sample frame**: `n = 1` → 1 byte/frame, `n = 2` → 2 bytes/frame (enabled channels in
-ascending order), `n = 3` or `4` → 4 bytes/frame (CH1…CH4). Measured: a 1 kHz square wave on CH1 has period **1250 frames in 1-, 2- and 4-channel
-modes at timebase idx 15**, and `n` bytes per frame. The ADC "mode" `k` (§10.2) only affects the ADC clocking, not the layout.
-**RAM contains stale data:** only the first `B × n(or 4)` bytes of a fresh capture are valid (the window of B = 4096 samples); the rest of the 64 KiB is
-left over from older captures, and the first 2–3 frames of an auto capture read from address 0 may also be stale. Always read the trigger-aligned window (§9.2).
-
-### 10.2 ADC channel mode and gains (`FUN_10002830`, VERIFIED on 1/2/4 channels and t = 3, 6, 7, 8, 15)
-
-Let `n` = enabled channels, `t` = timebase idx (0 = 2 ns), `g[i]` = gain code of channel `i` (CH1 = 0) from its V/div idx:
-`0→0xD, 1→0xA, 2→0x7, 3/6/9→0x5, 4/7/10→0x2, 5/8/11→0x0`.
-Mode `k` (also used for the sample interval): `n ≥ 3` → 4; `n = 2` → 2 if `t ≤ 7` else 4; `n = 1` → 1 if `t < 7`, 2 if `t = 7`, 4 if `t > 7`.
-(1 GS/s single, 500 MS/s dual, 250 MS/s quad.) Registers written with `08 00 00 d0 d1 reg 04 00` (HMCAD1511, 16-bit `d1:d0`), 3 ms apart, in this order:
-
-| reg | value |
-|---|---|
-| `0x3A` | quad: `0x0810` · n=1,t<7: `0x1010/0x0808/0x0404/0x0202` for CH1/2/3/4 · n=1,t=7: CH1 `0x1010`, CH2 `0x0404`, CH3 `0x0404`, CH4 `0x1010` · n=2,t<8: pair CH1+2 `0x1010`, 1+3 `0x1010`, 2+3 `0x0808`, 1+4 `0x1010`, 2+4 `0x0808`, 3+4 `0x0404` |
-| `0x3B` | quad: `0x0204` · n=1,t<7: same as 3A · n=1,t=7: CH1 `0x0808`, CH2 `0x0808`, CH3 `0x0202`, CH4 `0x0202` · n=2,t<8: pair 1+2 `0x0808`, 1+3 `0x0404`, 2+3 `0x0404`, 1+4 `0x0202`, 2+4 `0x0202`, 3+4 `0x0202` |
-| `0x0F` | `0x0000` |
-| `0x31` | k=4: `0x0204`; k=2: `0x0102`; k=1: `0x0001` |
-| `0x2A` (k = 4) | gain word `g4<<12 \| g3<<8 \| g2<<4 \| g1` (`g1` = CH1) |
-| `0x2B` (k = 1, 2) | build `word` (n=1: `g·0x1111` of the enabled channel; n=2: low byte `g(first)·0x11`, high byte `g(last)·0x11`), then `d0 = ((hi ^ lo) & 0xF) ^ hi`, `d1 = lo & 0xF` |
-
-Plus once per configuration: `08 00 00 3F 00 55 04 00` (reg `0x55`, PCB 1.06 → `0x3F`).
-
-### 10.3 Relays (VERIFIED), trigger source (VERIFIED), timebase (VERIFIED), horizontal (VERIFIED)
-
-- Relays: `08 00 c1 c2 c3 c4 01 00`, sleep 4 ms, same with each byte `& 0x86`, sleep 50 ms; per-channel byte as in §8.9 (bit7 BW limit, bit6 V/div > 1 V (idx > 8), bit5 ≤ 1 V, bit4 > 100 mV (idx > 5), bit3 ≤ 100 mV, bit2 DC, bit1 = 1).
-- Trigger source `12 00 b2 00 b4 b5` as §8.8 (with `n`, `t`, `mask`, source `s`, peak `p`; `uv6 = mask >> s`):
-  `b2 = p<<6 | mask<<2 | x`, `b4 = y & 3`, `b5 = (~uv6 & 1)<<2 | z`; `n=1`: `x = 0 (t<7), 1 (t=7), 2 (t=8), 3 (t>8)`, `y = 3−x`;
-  `n=2`: `x = 0 (t<8), 1 (t=8), 2 (t>8)`, `y = 2−x`; `n≥3`: `x = (t>8)`, `y = 1−x`;
-  `z = 0` (k=1) · k=2: `n=1 ? (mask is CH1 or CH3 → 0 else 1) : (uv6 == 1)` · k=4: `s`.
-- Timebase `0F 00 <divisor−1 as u32>` per §8.5; sample interval `f` (ns): `k` ns for `t ≤ 7`, else 4, 8, 20, 40, 80, 200, 400, 800, 2000 … for t = 8, 9, 10, …
-- Horizontal `10 00 …` per §9.2 (B = 4096, 50 %).
-
-### 10.4 Channel position from the calibration table (VERIFIED for V/div ≥ 100 mV)
-
-Calibration table = 576 u16 + flag (`0xA2/0x1600`, 1154 bytes, flag `0xFBCF`). For channel `ch` (CH1 = 0), V/div idx `v`, mode `k`:
-- `row = 5` for `v ≤ 5`, `8` for `v = 6..8`, `11` for `v = 9..11`;  `m = 4` (k=4), `2` (k=2), `0` (k=1);  `idx = m + 12·(12·ch + row)`;  `a = W[idx]`, `b = W[idx+1]`.
-- if `v ∈ {5, 8, 11}`: `lo = a`, `hi = b`. Otherwise `avg = (a + b + 1) >> 1`, `mul = 0.02 (v=0), 0.05 (v=1), 0.1 (v=2), 0.2 (others)`,
-  `d = floor((b − avg)·mul + 0.5)`, `lo = avg − d`, `hi = avg + d`.
-- `word = trunc((hi − lo)·nPos/255 + lo)` for `nPos` 0–255; sent as `<id> 00 lo hi`, id = `0` for CH1, `1 << (ch−1)` for CH2–CH4 (so CH2 = `01`, CH3 = `02`, CH4 = `04`).
-
-Measured baseline level (counts, open input, DC) for `nPos` = 0 / 128 / 255, CH3/CH4, k = 4 (1- and 2-channel modes give the same within ~1 count):
-
-| V/div idx | 5 (100 mV) | 6 (200 mV) | 8 (1 V) | 9 (2 V) | 11 (10 V) | 7 / 10 (500 mV, 5 V) | 4 (50 mV) |
-|---|---|---|---|---|---|---|---|
-| nPos 0 | 32.9 | 33.8 | 31.5 | 33.6 | 31.5 | 90.0 | 109.8 / 94.2 |
-| nPos 128 | 132.5 | 130.5 | **128.0** | 130.3 | **128.0** | 129.0 | 135.5 |
-| nPos 255 | 228.6 | 226.9 | 225.0 | 226.6 | 225.0 | 167.0 | 173.7 |
-
-So `nPos` 0…255 maps linearly to **≈ 32…225 counts** (centre 128) at the "full" ranges (1 V, 10 V) and to ≈ 90…167 for the 500 mV / 5 V groups (the vendor halves their span with `mul = 0.2`).
-For idx 0–4 (2 mV … 50 mV) the open-input baseline is far from 128 (e.g. idx 0 at nPos 128 → 204/120); these ranges amplify the floating input's offset and need a **shorted input** to judge — to re-measure.
-
-### 10.5 What is verified vs. open after this round
-
-Verified on the 6254BC: transport, init, ADC modes for n = 1/2/4 at t = 3, 6, 7, 8, 15 (valid, flat baseline 128), relay bytes for all 12 V/div (results above), trigger source for the tested combinations,
-trigger level/position, data layout, calibration-based position for V/div idx 5–11.
-Open: true sample rate for the 1 GS/s / 500 MS/s modes (needs a fast signal), amplitude calibration in volts per count (`dsoHTSetAmpCalibrate`, `0xA2/0x1B00` table), V/div idx 0–4 with shorted input, AC coupling and bandwidth-limit relays,
-pulse/video triggers, roll/scan modes, AWG, the stale-data behaviour in auto mode, and the control requests `0xEC/0xED/0xE3/0xF4`.
-
-### 10.6 Shorted-input measurements (CH1 shorted, 2026-11-20) — VERIFIED
-
-`cargo run --release -- short|bw` in `docs/tools/config_probe/` (env `BW=1` sets the bandwidth-limit relay bit, `AC=1` clears the DC bit).
-
-**Position formula (§10.4) is correct for all 12 V/div settings**, in both 4-channel and 1-channel modes. Mean level (counts) at `nPos` = 0 / 128 / 255:
-
-| V/div idx | nPos 0 | nPos 128 | nPos 255 | noise sd (counts) |
-|---|---|---|---|---|
-| 0 (2 mV) | 38–39 | 136 | 230–233 | 19–24 |
-| 1 (5 mV) | 33.8 | 131–133 | 228 | 8.6 |
-| 2 (10 mV) | 32.7–33.3 | 129–130 | 226 | 4.1 |
-| 3 (20 mV) | 31.5–32.0 | 128.9 | 224.8 | 2.1 |
-| 4 (50 mV) | **89.3** | 128.0 | **166.6** | 0.9 |
-| 5 (100 mV) | 31.1 | 128.1 | 224.4 | 0.5 |
-| 6 (200 mV) | 31.5 | 128.3 | 224.4 | 0.5 |
-| 7 (500 mV) | **89.0** | 128.0 | **166.1** | ≤ 0.05 |
-| 8 (1 V) | 31.0 | 128.0 | 224.0 | 0 |
-| 9 (2 V) | 31.7 | 128.2 | 224.5 | 0.4 |
-| 10 (5 V) | **89.0** | 128.0 | **166.1** | 0 |
-| 11 (10 V) | 31.0 | 128.0 | 224.0 | 0 |
-
-So a shorted input reads 128 ± noise at `nPos` 128 for every range; the 2 mV and 5 mV rows are offset by a few counts (residual amplifier offset, the
-calibration table has no separate row for them). The spans are ≈ 31…224 counts, except idx 4, 7, 10 (the `mul = 0.2` group) which span ≈ 89…166.
-Idx 0–3 are dominated by input noise (sd 20 counts at 2 mV).
-
-**Bandwidth-limit bit (relay byte bit 7) works:** on the shorted input the noise standard deviation drops from 21.4 → 9.8 (2 mV), 8.5 → 4.2 (5 mV), 2.1 → 1.0 (20 mV).
-
-**AC coupling:** clearing relay-byte bit 2 (DC → AC) is accepted and the shorted-input result is unchanged (as expected); the DC/AC difference itself needs a signal with
-a DC offset to confirm.
-
-Remaining open (updated in 10.7-10.9: volts scale, AC coupling and the sample rate are now verified): pulse/video triggers, scan/roll, AWG, `0xEC/0xED/0xE3/0xF4`.
-
-### 10.7 Amplitude table (`0xA2/0x1B00`, per-unit gain trim) — VERIFIED
-
-Control read `0xA2`, wValue `0x1B00`, 578 bytes: 288 little-endian words (4 channels x 12 rows x 6 slots) followed by the
-flag word `0xFACF`. If the flag is wrong the vendor code uses no correction. Values are gain factors in 1/1024 units
-(`0x400` = 1.0). Rows are the V/div index remapped to 5 (idx 0-5), 7 (idx 6-8) or 9 (idx 9-11); only those rows (plus a few
-words of row 8) hold data. Slot 0, 1, 2 = ADC channel mode k = 1, 2, 4 (the other three slots stay `0x400`). On the 6254BC
-the trims are within a few percent, differ per channel (500 mV row, slot 0: CH1 `0x455`, CH2 `0x440`, CH3 `0x445`,
-CH4 `0x454`) and are near 1.0 in the four channel mode.
-
-The vendor applies the table with command `0x1E` (`dsoHTSetAmpCalibrate`), 26 bytes: `1e 00`, four trims as u16 LE
-(bytes 2..9), then for each trim other than `0x400` a 4-byte LE offset word `trunc(p' * (1024 - t) + 0.5)`
-(`+0x2000000` if negative) at bytes `10 + 4i`, with `p' = trunc((position - 128) * 0.78125 + 128.5)`. For one channel
-mode the single enabled channel supplies the trim and position for all four words; for two channel mode the first
-enabled channel's trim fills all four and positions are `[first, first, second, second]`; for four channel mode each
-channel uses its own. **Effect, verified on hardware:** the FPGA multiplies the samples by `t/1024` around the zero
-level (sending `0x440` for CH2 at 500 mV/div raised the signal above zero by 1.06x while the zero stayed at code 128). It
-persists across captures. The library sends it at the end of `configure`. Note that one enabled channel at a timebase
-index above 7 runs in ADC channel mode 4, so slot 2 applies there, not slot 0.
-
-### 10.8 Counts to volts
-
-The vendor SDK demos assume `volts = (code - (255 - position)) * 8 * V/div / 255`, i.e. 32 counts per division and a
-zero code of `255 - position`. **That does not hold on the 6254BC.** Measured instead, with a 0.994 V DC source
-(multimeter) on CH2 and CH1 shorted as the zero reference:
-
-| ADC channel mode k | counts per division | zero code at position 0 / 255 | same, ranges idx 4, 7, 10 |
+| PAL / SECAM | 0 to 5 | `2n + 0x134` |
+| | 6 to 310 (`0x136`) | `n + 0x13E` |
+| | 311 to 318 (`0x13E`) | `2n − 0x125` |
+| | 319 to 622 (`0x26E`) | `n − 0x13F` |
+| | 623 to 625 (`0x271`) | `2n − 0x3AE` |
+| NTSC | 0 to 9 | `2n + 0xFC` |
+| | 10 to 263 (`0x107`) | `n + 0x106` |
+| | 264 to 271 (`0x10F`) | `2n − 1` |
+| | 272 to 525 (`0x20D`) | `n − 0x110` |
+
+## 9. Converting samples to volts
+
+**Verified** against a 0.994 V (multimeter) and a 0.298 V DC source, from 50 mV to 1 V per division. The vendor SDK demos
+assume `volts = (code − (255 − position)) × 8 × V/div / 255`, that is 32 counts per division and a zero code of
+`255 − position`. That does not hold on the 6254BC: it reads the 1 kHz calibrator as 1.5 V where the true output is about
+1.91 V. Use instead:
+
+```
+volts = (code − zero) × (V/div) / counts_per_div
+```
+
+Counts per division and zero code depend on the ADC channel mode `k` (7.2). The position control always spans 8 divisions,
+so zero at position 0 and 255 scales with the counts per division:
+
+| k | counts per division | zero at position 0 / 255 | same, ranges 50 mV, 500 mV, 5 V (indexes 4, 7, 10) |
 |---|---|---|---|
-| 4 (3-4 channels, slower timebases) | 24.15 | 31 / 224 | 89 / 166 |
+| 4 | 24.15 | 31 / 224 | 89 / 166 |
 | 2 | about 21.6 | about 39 / 216 | 92 / 162 |
-| 1 (one channel, timebase idx < 7) | about 21.1 (with the factory trim) | about 43 / 212 | 99 / 156 |
+| 1 | about 21.1 | about 43 / 212 | 99 / 156 |
 
-Position 128 is code 128 in every mode, and the zero span is 8 divisions in each mode (the position control always covers
-+-4 divisions). Counts per division were checked from 200 mV to 1 V per division at several positions in mode 4 (24.1 to
-24.2), and at 500 mV and 1 V in the other modes. The 1 kHz calibrator then reads about 1.9 V, not the nominal 2 V.
-Zero levels vary by a few counts between ranges and between channels (a shorted CH4 sat 2 counts above a shorted CH1 at
-200 mV/div); the table gives typical values, so volts can be off by 2-3 counts (up to about 5 % of a division-scale
-reading) at extreme positions in the fast modes.
+The zero code is `lo + position × (hi − lo) / 255` with these end values; position 128 is code 128 in every mode. The
+scale holds with the factory gain trim of 7.7 applied. Measurement data is in Appendix A.2 and A.3.
 
-Second check with a 0.298 V DC source on CH2 (a load across the source was needed to keep it steady) and a shorted CH4 as
-the zero reference, medians of two captures: 50 mV/div (position 0) gives 24.0 counts per division in mode 4, 21.5-21.6 in
-mode 2 and 21.3 in mode 1; 100 mV/div gives 23.8, 21.8 and 20.5-20.8. These agree with the table above to 1-3 %, and the
-library's volts read 0.294-0.301 V for 0.298 V. At 200 mV and 500 mV/div the signal is only 11-33 counts, so quantisation
-dominates. Open inputs are not a zero reference: at 100 mV/div an open CH1 and CH3 showed a square wave (12 counts
-peak-to-peak) coupled from the calibrator on CH4. Ranges below 50 mV/div and above 1 V/div have not been checked against
-a reference. The scale comes from one unit.
+Limits: the values come from one unit; zero levels vary by a few counts between ranges and between channels (a shorted CH4
+sat 2 counts above a shorted CH1 at 200 mV per division), so volts can be off by 2 to 3 counts (up to about 5 % of a
+division-scale reading) at extreme positions in the fast modes; ranges below 50 mV and above 1 V per division were not
+checked against a reference. An open input is not a zero reference: it picks up signals from neighbouring channels (12
+counts peak-to-peak at 100 mV per division from a calibrator on the next input).
 
-### 10.9 AC coupling and sample clock — VERIFIED (CH2 on a 0.994 V DC source, CH4 on the 1 kHz calibrator)
+## 10. Verification status and limitations
 
-- **AC coupling** (relay byte with the DC bit cleared, set by `Coupling::Ac`): CH2 reads 1.000 V in DC and about
-  -0.005 V in AC (the DC level is blocked). CH4's calibrator square wave reads 0..1.9 V in DC and -0.95..+0.95 V in AC
-  (mean 0.009 V). Plateau separation on CH4 is 1.908 V and matches CH2's 1.907 V, so the channels agree to 0.1 %;
-  the calibrator's real output is about 1.91 V, not the nominal 2 V.
-- **Sample clock**: the mean calibrator period measured on the time axis is 1000.000 us (+-0.001 %) at 200 us to 50 ms per
-  division (up to 818 periods averaged), and the 500 us half period holds at 50 us per division (idx 13). So
-  `sample_interval_ns` (= ns per division / 250 for idx >= 8) is exact from idx 13 to 22.
-- **Fast timebases (idx 0..12)**: the calibrator is too slow for a period measurement, but its edge has a finite
-  rise time. The 10-90 % rise measured about 240-256 ns at every timebase from 20 us/div (80 ns interval) to 2 ns/div
-  (1 ns interval), e.g. 4 samples at 80 ns, 31 at 8 ns, 63 at 4 ns and about 250 at 1 ns. The intervals are therefore
-  consistent with the verified clock, including the 1 GS/s one channel mode and the 500 MS/s two channel mode at
-  500 ns/div. Sample amplitudes in modes 1 and 2 are lower than in mode 4 (see 10.8).
+| Feature | Status |
+|---|---|
+| USB transport, initialisation, identification, calibration tables | Verified |
+| 1, 2, 3, 4 channel acquisition, data layout | Verified (3 channels: layout only) |
+| Time bases | Tested at indexes 0 to 22 (period for 13 to 22, edge rise time for 0 to 12) and at 24, 25, 27 and 30 (streaming rates); the others share the same divisor table but were not measured |
+| 12 vertical ranges, relays, bandwidth limit, AC/DC coupling | Verified |
+| Edge trigger (level, slope, position, auto and normal sweep) | Verified |
+| Pulse trigger | Verified (500 µs pulses, all conditions, both polarities) |
+| Video trigger | Vendor only (no video signal) |
+| Scan/roll streaming | Verified |
+| Gain trim table and zero model | Verified on one unit |
+| Volts conversion | Verified from 50 mV to 1 V per division |
+| Serial-bus triggers (CAN, LIN, UART, SPI, I2C), peak detect, alternate trigger | Not implemented |
+| Signal generator (DDS) | Absent on the 6254BC; not implemented |
+| LAN / USB-module requests (`0xEC`, `0xED`, `0xF4`) | Stall on the 6254BC |
 
-### 10.10 Pulse and video triggers
+Known limitations of the library and open items:
 
-Both follow the trigger mode command `11 00 mode slope couple 00` (mode 0 edge, 1 pulse, 2 video; slope 0 rising or
-positive, 1 falling or negative; coupling byte 0 = DC) with a second packet. The library sends them at the end of
-`configure`, after the trigger level.
+- **Trigger position accuracy.** The trigger edge lands within about ±6 samples of the requested position, and the
+  offset depends on the number of enabled channels and the time base (at 200 µs per division about +5, −2 and −6
+  samples for 1, 2 and 4 channels, Appendix A.4). The hardware latency is not modelled.
+- **Window arithmetic** (6.2) was verified for 1, 2 and 4 channels at 4096 samples; other window lengths are untested.
+- **Volts** scale and zero model come from one unit and a few DC levels (section 9).
+- **Roll streaming** cannot detect lost data from the pointer; the library infers overruns from the elapsed time.
+- The BC and BD share the PCB according to third-party reports, but only a BC was tested.
 
-**Pulse (`0x13`, 16 bytes) — VERIFIED on the 6254BC with the 1 kHz calibrator (500 us pulses):**
-`13 00 | a u32 | 1.05a u32 | 0.95a u32 | cond << 1 | 00`, where `a = trunc(width_ns * 0.125)` (units of 8 ns) and cond is
-0 equal, 1 not equal, 2 greater, 3 less. The vendor header documents the width in units of 5 ns, which would give
-`ns / 40`; with that the hardware saw pulses five times too wide (Greater triggered up to a 2.4 ms setting and not at
-2.5 ms for a 500 us pulse, at 20 us, 200 us and 1 ms per division alike), so the vendor argument is effectively in
-nanoseconds and the counter runs at 125 MHz. With the fix, all 14 test cases behave: Equal triggers for 480-520 us (the
-+-5 % window) and not at 450 or 560 us; Greater/Less/Not equal trigger only when the real width is wider/narrower/different;
-positive and negative pulses (`slope`) both work. The capture is aligned to the start of the pulse (the edge that begins it),
-like an edge trigger.
+## Appendix A: Measurement data
 
-**Video (`0x16`, 16 bytes) — implemented from the vendor code, NOT verified with a video signal:**
-`16 00 | line counter low | ((positive << 3 | sync) << 3) | counter bits 9..8 | level + 2 | level - 2 | 5b 0e 3b 0d 4b 02 2c 01 |
-logic source (0) | 32`. The 1-based line number is remapped to the hardware counter (PAL/SECAM: `2n+0x134` for n<6,
-`n+0x13e` up to 0x136, `2n-0x125` up to 0x13e, `n-0x13f` up to 0x26e, `2n-0x3ae` up to 0x271; NTSC: `2n+0xfc` for n<10,
-`n+0x106` up to 0x107, `2n-1` up to 0x10f, `n-0x110` up to 0x20d). Sync select: 0 all lines, 1 line number, 2 odd field,
-3 even field, 4 all fields (the line number is 1 for the modes that do not use one). On the calibrator the device accepts
-the command, never triggers (it is not a video signal) and an edge capture works normally afterwards.
+### A.1 Test setup
 
-### 10.11 Scan and roll modes — VERIFIED (CH4 on the 1 kHz calibrator, CH2 on DC)
+A single Hantek 6254BC on a Linux host through `rusb`/libusb. Signal sources: the scope's 1 kHz probe-compensation
+output (about 1.91 V peak-to-peak, nominally 2 V), a laboratory DC source read with a multimeter (0.994 V and 0.298 V,
+the latter with a load to stabilise it), and shorted inputs as zero references.
 
-In the vendor software scan (time base idx >= 25, 500 ms/div) and roll (idx >= 27, 2 s/div) are display modes on top of
-one hardware behaviour: after `03 00 flags 00` the FPGA keeps writing samples into the 64 KiB circular capture RAM and the
-host reads what is new (`dsoHTGetScanData` / `dsoHTGetRollData` -> `FUN_10005b60` / `FUN_10005d60`):
-1. send `0D 00`, read the status; `u16 @ 2` is the write pointer (end address), `u16 @ 0` the stale trigger address;
-2. new bytes = `(end - last) mod 0x10000`, rounded down to whole frames (`frame_stride` bytes per frame, even);
-3. `0E 00 last_lo last_hi` (read address), `05 00 words_lo words_hi` (read back `bytes / 2` words), read the bytes;
-4. remember `end` as the new `last`. (The vendor roll path adds 8 to the read address on its very first read; not needed.)
-`dsoHTSetSampleRate`'s `nYTFormat` argument is ignored by the DLL, `dsoHTOpenRollMode`/`dsoHTCloseRollMode`/
-`dsoHTStartRoll` do nothing, and the start flags (bit 0 auto, bit 1 roll) made no difference to the pointer on a 6254BC
-(the state word stays `0xc100`, never "ready"). The RAM size is 0x10000 bytes (0x8000 for the CAN/LIN/UART/SPI/I2C trigger
-modes, not implemented here).
+### A.2 Counts per division
 
-Measured: the pointer advances in steps of 8 bytes at `frame_stride / sample_interval` bytes per second (500 B/s for one
-channel at 500 ms/div; 5000 B/s for four channels at 200 ms/div), so at slow time bases data arrives in bursts of 8 bytes
-(one burst every 0.64 s at 20 s/div, one channel). Sample rates matched the time base (499/s at 500 ms/div, 123/s at
-2 s/div, 1247/s at 200 ms/div). With the calibrator aliased to a 5-sample pattern (200 ms/div: 0.8 ms interval), the pattern
-held over 27 582 samples per channel across 1.68 buffer wraps with four channels, including the deinterleave and the wrap
-of the read address; the only deviations are one-sample flips about every 3000 samples where an edge lands on the threshold
-because the sample clock drifts slightly against the calibrator. The first ~11-16 frames after the start are stale RAM and
-are dropped (as in the normal capture). If the host does not read for longer than the RAM takes to fill, data is lost and
-the pointer alone cannot say so; the library estimates it from the elapsed time and returns an overrun error.
+DC source on CH2, shorted input on another channel as zero (medians or means of two to three captures). Counts per
+division is `(CH2 − zero) / (volts / (V/div))`.
 
-### 10.12 The previously unknown control requests — read-only investigation
-
-Decoded from the vendor DLL and probed on the 6254BC with read-direction requests only (no `0xEC` writes were sent):
-
-| Request | wValue | Length | Vendor function | On the 6254BC |
+| Source | Range | Mode k=4 | Mode k=2 | Mode k=1 |
 |---|---|---|---|---|
-| `0xE3` IN | `0x15F0` | 4 | `dsoGetDriverVersion`: each nibble is one digit, 8 digits | works: `20 16 05 31` = `20160531`, the same four bytes that sit at offset `0x10` of the `0xA2/0x15E0` area |
-| `0xED` IN | `0x1700` | 0x14 | `dsoUSBModeGetIPAddr`: IP, subnet mask, gateway (4 bytes each, byte-swapped), port u16, MAC (6 bytes) | stalls (Pipe error) |
-| `0xEC` OUT | `0x1700` | 0x14 | `dsoUSBModeSetIPAddr`: same layout | not sent (a write) |
-| `0xED` IN | `0x1716` | 1 | `dsoGetLANEnable` | stalls |
-| `0xEC` OUT | `0x1716` | 1 | `dsoSetLANEnable` | not sent (a write) |
-| `0xF4` IN | `0x1F00` | 2 | `dsoGetUSBModulVersion` | stalls |
-| `0xE5` IN | 0 | 10 | bus select (see 3) | stalls (as before) |
+| 0.994 V | 200 mV, 500 mV, 1 V per div | 24.1 at each | (500 mV, 1 V) 21.5 to 21.6 | (500 mV, 1 V) 21.1 |
+| 0.298 V | 50 mV per div (position 0) | 24.0 | 21.5 to 21.6 | 21.3 |
+| 0.298 V | 100 mV per div | 23.8 | 21.8 | 20.5 to 20.8 |
 
-So `0xEC`/`0xED`/`0xF4` belong to the LAN/USB-module option that some models have (`dsoOpenLan`, `dsoSetLANEnable`);
-this unit's firmware answers them with a stall, which is harmless: the control pipe recovers and the scope works
-normally afterwards. The library exposes only the driver version (`Scope::driver_version`, shown by `hantek6xx4 info`).
-The `0xA2/0x15E0` area (32 bytes before the calibration table) holds that version and otherwise `0xFF`, plus a few bytes
-whose purpose is unknown (`08 bf` at the start, `ea ea` at offset 6); the vendor code reads word 1 as the DDS calibration
-factor, which is `0xFFFF` (blank) here.
+At 2 V per division and above the signal is only a few counts, so quantisation dominates. The library's volts read 0.294 to
+0.301 V for 0.298 V and 0.99 to 1.00 V for 0.994 V.
 
+### A.3 Zero level of a shorted input
+
+Mean ADC code at position 0 / 128 / 255, shorted input, four-channel mode (modes 1 and 2 follow the end values of
+section 9):
+
+| Idx | Range | Pos 0 | Pos 128 | Pos 255 | Noise s.d. (codes) |
+|---|---|---|---|---|---|
+| 0 | 2 mV | 38 to 39 | 136 | 230 to 233 | 19 to 24 |
+| 1 | 5 mV | 33.8 | 131 to 133 | 228 | 8.6 |
+| 2 | 10 mV | 32.7 to 33.3 | 129 to 130 | 226 | 4.1 |
+| 3 | 20 mV | 31.5 to 32.0 | 128.9 | 224.8 | 2.1 |
+| 4 | 50 mV | **89.3** | 128.0 | **166.6** | 0.9 |
+| 5 | 100 mV | 31.1 | 128.1 | 224.4 | 0.5 |
+| 6 | 200 mV | 31.5 | 128.3 | 224.4 | 0.5 |
+| 7 | 500 mV | **89.0** | 128.0 | **166.1** | ≤ 0.05 |
+| 8 | 1 V | 31.0 | 128.0 | 224.0 | 0 |
+| 9 | 2 V | 31.7 | 128.2 | 224.5 | 0.4 |
+| 10 | 5 V | **89.0** | 128.0 | **166.1** | 0 |
+| 11 | 10 V | 31.0 | 128.0 | 224.0 | 0 |
+
+The 2 mV and 5 mV rows are offset by a few codes (residual amplifier offset; the calibration table has no separate row
+for them). On the 20 mV range and below the readings are dominated by input noise. The bandwidth limit reduces that
+noise: the standard deviation falls from 21.4 to 9.8 codes at 2 mV, 8.5 to 4.2 at 5 mV and 2.1 to 1.0 at 20 mV.
+
+### A.4 Trigger position
+
+Rising edge of the 1 kHz calibrator, 4096-sample window, 200 µs per division (800 ns per sample), level mid-way between the
+plateaus. Offset of the observed edge from the requested position, in samples:
+
+| Enabled channels | Rising | Falling |
+|---|---|---|
+| 1 | +6 | +4 |
+| 2 | −1 to −2 | −3 to −4 |
+| 4 | −5 | −6 |
+
+At 100 µs per division with one channel the edge was at +0 to +1, so the offset is not constant across time bases.
+
+At 10 %, 50 % and 90 % horizontal position with four channels, the edge lay 5 samples (about 4 µs) before the ideal position
+with a jitter of ±1 to 2 samples.
+
+### A.5 Pulse trigger
+
+Calibrator on CH4 (positive and negative pulses of 500 µs), normal sweep. "T" = triggered, "–" = timed out:
+
+| Condition and width | Result | | Condition and width | Result |
+|---|---|---|---|---|
+| equal 500 µs, positive / negative | T / T | | greater 400 µs | T |
+| equal 480 µs, 520 µs | T, T | | greater 600 µs | – |
+| equal 450 µs, 560 µs | –, – | | less 400 µs | – |
+| equal 200 µs, 1 ms | –, – | | less 600 µs | T |
+| not equal 200 µs | T | | not equal 500 µs | – |
+
+With the vendor-documented 5 ns unit the greater-than threshold sat between 2.4 and 2.5 ms for the 500 µs pulse at
+20 µs, 200 µs and 1 ms per division, i.e. exactly 500 µs ÷ 0.2: the width unit is 8 ns for an argument in nanoseconds.
+
+### A.6 Sample clock
+
+| Check | Result |
+|---|---|
+| Mean calibrator period on the time axis, 200 µs to 50 ms per division, up to 818 periods | 1000.000 µs (±0.001 %) |
+| Half period at 50 µs per division (index 13) | 500.0 µs |
+| 10 to 90 % rise time of the calibrator edge, 20 µs per division down to 2 ns per division | 240 to 256 ns at every setting, 4 samples at 80 ns, 31 at 8 ns, 63 at 4 ns and about 250 at 1 ns |
+
+### A.7 Roll streaming
+
+Calibrator aliased into a repeating 5-sample pattern (200 ms per division, 0.8 ms per sample). Four channels over 22 s
+(1.68 buffer wraps): 27 582 samples per channel, the pattern holds across all polls and the wrap; the only deviations are
+single-sample flips about every 3000 samples where an edge sits on the threshold because the sample clock drifts slowly
+against the calibrator. Rates: 499 samples/s at 500 ms per division, 123 at 2 s (expected 125), 1247 at 200 ms
+(expected 1250).
+
+## Appendix B: Vendor API map
+
+The vendor SDK (`HTHardDll`) exports the functions below; the table shows where the library implements them.
+
+| Vendor function | Command or area | Section |
+|---|---|---|
+| `dsoInitHard` | initialisation | 5 |
+| `dsoHTGetState`, `dsoHTStartCollectData` | `06`, `03` | 6.1 |
+| `dsoHTGetData` | `0D`, `0E`, `05` | 6.2 |
+| `dsoHTGetScanData`, `dsoHTGetRollData` | `0D`, `0E`, `05` | 6.4 |
+| `dsoHTADCCHModGain` | ADC register `0x55` | 7.2 |
+| `dsoHTSetSampleRate` | ADC registers, `0F`, `10` | 7.2 to 7.4 |
+| `dsoHTSetCHAndTrigger` | relays, ADC registers, `12` | 7.5, 8.1 |
+| `dsoHTSetCHPos` | `00`/`01`/`02`/`04` | 7.6 |
+| `dsoHTSetAmpCalibrate` | `1E` | 7.7 |
+| `dsoHTSetVTriggerLevel` | `07` | 8.2 |
+| `dsoHTSetTrigerMode` | `11` | 8.3 |
+| `dsoHTSetPulseTriger`, `dsoHTSetVideoTriger` | `13`, `16` | 8.4, 8.5 |
+| `dsoHTReadCalibrationData`, `dsoHTRDAmpCali` | `0xA2/0x1600`, `0xA2/0x1B00` | 3.3, 3.4 |
+| `dsoGetDriverVersion` | `0xE3/0x15F0` | 2.2 |
+| `dsoGetHardInfo`, `dsoSetHardInfo` | `0xA2/0x1580` (the library only reads) | 3.1 |
+| `dsoSetUSBBus`, `dsoSetSPIBus` | `0xEA`, `0xE5` | 2.2 |
+| `dsoUSBModeSet/GetIPAddr`, `dsoSet/GetLANEnable`, `dsoGetUSBModulVersion` | `0xEC`, `0xED`, `0xF4` | 2.2 |
+| `dsoWriteFlash`, `dsoReadFlash` | `0xF0`, `0xF1` | 2.2 (not implemented) |
+| `dds*` (generator) | not on the 6254BC | 1 |
