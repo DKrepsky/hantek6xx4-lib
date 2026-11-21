@@ -601,9 +601,19 @@ Remaining open: volts-per-count scale (needs a known voltage or `0xA2/0x1B00` de
 
 ### 10.7 Counts to volts
 
-Vendor convention (SDK demos, `MeasDll`): `volts = (code - zero) * 8 * V/div / 255`, with `zero = 255 - position`
-(code 127 for the default position 128). The 8 vertical divisions span the 8-bit range, so about 32 counts per
-division. `dsoHTSetAmpCalibrate` does not feed this formula: it writes hardware gain/offset words (command `0x1E`) from a
-built-in table. Checked on the 6254BC with the probe-compensation output on CH2: 1.51 V peak-to-peak at 500 mV, 1 V, 2 V
-and 5 V per division, low level at 0 V. The absolute calibrator voltage and per-unit gain error are not verified
-against an external reference; the `0xA2/0x1B00` amplitude table is not used by this conversion.
+The vendor SDK demos assume `volts = (code - (255 - position)) * 8 * V/div / 255`, i.e. 32 counts per division and a
+zero code of `255 - position`. **That does not hold on the 6254BC**: it reads the 2 Vpp calibrator as 1.5 V.
+Measured instead (calibrator on CH2):
+
+- Counts per division: the two plateaus of the calibrator are 92.1 counts apart at 500 mV/div and 46.0 at 1 V/div, so
+  **23.0 counts per division** (calibrator taken as 2.00 V; 2 V/5 V/10 V per division agree within quantisation).
+  The vendor position scale `(pos - 128) * 0.78125 + 128.5` (0.78125 = 200/256) hints at a design value of about 25.
+- Zero level versus position (all 12 V/div, shorted input): code 31 at position 0, about 128 at 128, 224 at 255, i.e.
+  `31 + position * 193 / 255`, not `255 - position`.
+
+`dsoHTSetAmpCalibrate` does not feed this: it sends a 26-byte command `0x1E` with per-channel offset words
+`trunc(p' * (1024 - t) + 0.5)` where `p' = trunc((pos - 128) * 0.78125 + 128.5)` and `t` comes from the amplitude table
+(`0xA2/0x1B00`, default `0x400` = skip). This command is not implemented in the library yet and is not needed for
+capture. The scale is derived from one unit and the calibrator's nominal voltage; per-unit gain differences and the
+sub-200 mV ranges (no suitable signal) are unverified. The zero-versus-position line is linear but can be off by a few
+counts (about 0.1 V at 1 V/div) away from the default position 128.

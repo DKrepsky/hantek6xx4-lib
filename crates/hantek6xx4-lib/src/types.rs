@@ -170,7 +170,7 @@ pub struct ChannelConfig {
     pub volts_per_div: VoltsPerDiv,
     pub coupling: Coupling,
     pub bandwidth_limit: bool,
-    /// Vertical position, 0..=255. Zero volts is at ADC code `255 - position` (127 for the default 128).
+    /// Vertical position, 0..=255. Zero volts is at ADC code `31 + position * 193 / 255` (about 128 for the default 128).
     pub position: u8,
 }
 
@@ -280,6 +280,17 @@ pub struct ScopeInfo {
     pub fpga_version: u16,
 }
 
+/// ADC counts per vertical division, measured on a 6254BC against its 2 Vpp probe-compensation output
+/// (92.1 counts at 500 mV/div and 46.0 counts at 1 V/div, so 23.0). The vendor SDK demos assume 255/8 = 32, which
+/// would read the calibrator as 1.5 V. Not verified against an external reference or on other units.
+pub const COUNTS_PER_DIV: f64 = 23.0;
+
+/// ADC code of 0 V for a vertical position `0..=255`, measured on a 6254BC for all V/div: 31 at position 0,
+/// about 128 at 128 and 224 at 255 (a slope of 193/255 codes per position step).
+pub fn zero_code_for_position(position: u8) -> f64 {
+    31.0 + f64::from(position) * 193.0 / 255.0
+}
+
 /// One acquisition.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -287,8 +298,8 @@ pub struct Frame {
     pub samples: [Vec<u8>; MAX_CHANNELS],
     /// Volts per division each channel was captured with.
     pub volts_per_div: [f64; MAX_CHANNELS],
-    /// ADC code that corresponds to 0 V for each channel (`255 - position`).
-    pub zero_code: [u8; MAX_CHANNELS],
+    /// ADC code that corresponds to 0 V for each channel (see [`zero_code_for_position`]).
+    pub zero_code: [f64; MAX_CHANNELS],
     /// Time between samples in nanoseconds.
     pub sample_interval_ns: f64,
     /// True if the hardware trigger fired.
@@ -310,11 +321,11 @@ impl Frame {
 
     /// Convert one raw ADC code of `ch` to volts at the input (the probe attenuation is not applied).
     ///
-    /// Uses the vendor convention `(code - zero) * 8 * V/div / 255`: the 8 vertical divisions span the 8-bit range.
-    /// This is nominal; it ignores per-unit gain error and the exact calibrator voltage was not verified.
+    /// Uses `(code - zero) * V/div / COUNTS_PER_DIV`. The scale was measured against the 2 Vpp calibrator of one
+    /// 6254BC (see [`COUNTS_PER_DIV`]); per-unit gain differences are not corrected.
     pub fn code_to_volts(&self, ch: Channel, code: u8) -> f64 {
         let i = ch.index();
-        (f64::from(code) - f64::from(self.zero_code[i])) * 8.0 * self.volts_per_div[i] / 255.0
+        (f64::from(code) - self.zero_code[i]) * self.volts_per_div[i] / COUNTS_PER_DIV
     }
 
     /// Samples of one channel converted to volts, if it was enabled.
@@ -359,19 +370,21 @@ mod volts_tests {
     use super::*;
 
     #[test]
-    fn code_to_volts_uses_vendor_convention() {
+    fn code_to_volts_uses_measured_scale() {
         let frame = Frame {
-            samples: [vec![127, 255, 0], vec![], vec![], vec![]],
+            samples: [vec![128, 151, 105], vec![], vec![], vec![]],
             volts_per_div: [1.0, 1.0, 1.0, 1.0],
-            zero_code: [127, 127, 127, 127],
+            zero_code: [128.0, 128.0, 128.0, 128.0],
             sample_interval_ns: 1.0,
             triggered: false,
             trigger_sample: None,
         };
         let v = frame.volts(Channel::Ch1).unwrap();
         assert_eq!(v[0], 0.0);
-        assert!((v[1] - 128.0 * 8.0 / 255.0).abs() < 1e-12);
-        assert!((v[2] + 127.0 * 8.0 / 255.0).abs() < 1e-12);
+        assert!((v[1] - 23.0 / COUNTS_PER_DIV).abs() < 1e-12);
+        assert!((v[2] + 23.0 / COUNTS_PER_DIV).abs() < 1e-12);
+        assert!((zero_code_for_position(0) - 31.0).abs() < 1e-9);
+        assert!((zero_code_for_position(255) - 224.0).abs() < 1e-9);
         assert!(frame.volts(Channel::Ch2).is_none());
     }
 }

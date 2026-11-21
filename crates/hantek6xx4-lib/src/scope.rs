@@ -266,10 +266,10 @@ impl<T: Transport> Scope<T> {
             .triggered()
             .then(|| p::pre_trigger_samples(cfg.buffer_len, cfg.trigger.horizontal_position_percent) as usize);
         let mut volts_per_div = [0.0; MAX_CHANNELS];
-        let mut zero_code = [0u8; MAX_CHANNELS];
+        let mut zero_code = [0.0; MAX_CHANNELS];
         for (i, c) in cfg.channels.iter().enumerate().take(MAX_CHANNELS) {
             volts_per_div[i] = c.volts_per_div.volts();
-            zero_code[i] = 255 - c.position;
+            zero_code[i] = crate::types::zero_code_for_position(c.position);
         }
         Ok(Frame {
             samples,
